@@ -2,15 +2,20 @@
 High level interface to PyTables for reading and writing pandas data structures
 to disk
 """
+
 from __future__ import annotations
 
+import ast
 from contextlib import suppress
 import copy
 from datetime import (
     date,
     tzinfo,
 )
+import inspect
 import itertools
+import json
+import operator
 import os
 import re
 from textwrap import dedent
@@ -60,8 +65,10 @@ from pandas.core.dtypes.common import (
     is_list_like,
     is_string_dtype,
     needs_i8_conversion,
+    pandas_dtype,
 )
 from pandas.core.dtypes.dtypes import (
+    BaseMaskedDtype,
     CategoricalDtype,
     DatetimeTZDtype,
     ExtensionDtype,
@@ -83,12 +90,15 @@ from pandas import (
     isna,
 )
 from pandas.core.arrays import (
+    BooleanArray,
     Categorical,
     DatetimeArray,
+    IntegerArray,
     PeriodArray,
 )
 from pandas.core.arrays.string_ import BaseStringArray
 import pandas.core.common as com
+from pandas.core.computation.expr import _preparse
 from pandas.core.computation.pytables import (
     PyTablesExpr,
     maybe_expression,
@@ -1989,6 +1999,7 @@ class TableIterator:
         self.stop = stop
 
         self.coordinates = None
+        self.coord_chunks: Iterator[np.ndarray] | None = None
         if iterator or chunksize is not None:
             if chunksize is None:
                 chunksize = 100000
@@ -2000,6 +2011,18 @@ class TableIterator:
 
     def __iter__(self) -> Iterator:
         # iterate
+        if self.coord_chunks is not None:
+            for coord_chunk in self.coord_chunks:
+                # sub-chunk by ``chunksize`` so the returned frames never exceed
+                # the requested batch size
+                for i in range(0, len(coord_chunk), self.chunksize):
+                    value = self.func(None, None, coord_chunk[i : i + self.chunksize])
+                    if value is None or not len(value):
+                        continue
+                    yield value
+            self.close()
+            return
+
         current = self.start
         if self.coordinates is None:
             raise ValueError("Cannot iterate until get_result is called.")
@@ -2014,6 +2037,15 @@ class TableIterator:
 
         self.close()
 
+    def _nullable_plan(self) -> NullQueryPlan | None:
+        """return the three-valued plan when the query touches a nullable column"""
+        if not isinstance(self.s, Table) or self.where is None:
+            return None
+        if not self.s._nullable_layout:
+            return None
+        selection = Selection(self.s, self.where, start=self.start, stop=self.stop)
+        return selection.null_plan
+
     def close(self) -> None:
         if self.auto_close:
             self.store.close()
@@ -2024,7 +2056,13 @@ class TableIterator:
             if not isinstance(self.s, Table):
                 raise TypeError("can only use an iterator or chunksize on a table")
 
-            self.coordinates = self.s.read_coordinates(where=self.where)
+            plan = self._nullable_plan()
+            if plan is not None and not self.s.is_transposed:
+                # stream matching coordinates chunk-by-chunk so that iteration
+                # never materialises the whole key's hit list in memory
+                self.coord_chunks = plan.iter_coords(self.start, self.stop)
+            else:
+                self.coordinates = self.s.read_coordinates(where=self.where)
 
             return self
 
@@ -2696,6 +2734,935 @@ class DataIndexableCol(DataCol):
 
 class GenericDataIndexableCol(DataIndexableCol):
     """represent a generic pytables data column"""
+
+
+# ---------------------------------------------------------------------------
+# nullable (masked) integer / boolean column support
+# ---------------------------------------------------------------------------
+#
+# Layout
+# ------
+# A nullable logical column ``c`` is stored as *two* physical PyTables fields:
+#
+#   * ``c``             -- the payload, of the same width and signedness as the
+#                          logical dtype (``Int8`` -> ``Int8Col``, ``UInt64`` ->
+#                          ``UInt64Col``, ``boolean`` -> ``BoolCol``).  The
+#                          payload of a missing entry holds an arbitrary value;
+#                          it is never used as a sentinel.
+#   * ``c__valid``      -- a ``BoolCol`` holding True exactly where the entry is
+#                          *not* missing.  This is the only source of truth for
+#                          missingness; consumers must never infer it from the
+#                          payload.
+#
+# Versioned layout metadata is recorded in the table node attributes under
+# ``nullable_layout`` (a JSON document) which maps every *logical* user column
+# name to its physical ``payload`` / ``valid`` field names and to the logical
+# dtype.  The mapping is authoritative: user column names that happen to look
+# like (or collide with) auxiliary field names are harmless because all
+# lookups go through the mapping and all auxiliary field names are derived in
+# a namespace that is guaranteed disjoint from the (identified) user columns.
+#
+# Why a payload + validity pair rather than the alternatives?
+# -----------------------------------------------------------
+# * Masked-in-float (store ``Int64`` as ``float64`` + NaN) loses exactness at
+#   ``2**53`` and cannot round-trip ``UInt64`` at all above ``2**53``; it also
+#   cannot represent ``boolean`` without an implicit widening.  Rejected.
+# * A per-column sentinel (e.g. ``Int64.min``) inside the value domain clashes
+#   with legitimate data and forces range juggling in every query.  Rejected
+#   by the "no sentinel" requirement.
+# * Pickling the whole column / falling back to object dtype defeats on-disk
+#   indexing and native compression.  Rejected.
+#
+# The payload keeps its native width/signedness so PyTables can build a real
+# on-disk index for ``Int8..Int64``, ``UInt8..UInt32`` and ``boolean``.  The
+# validity field is the cheap source of truth for missingness and lets the
+# three-valued query planner pre-filter candidates (``valid == True``) before
+# reading the payload.  ``UInt64`` has no native PyTables index; we record that
+# and fall back to a chunk scan, keeping results exact.
+#
+# Query plan
+# ----------
+# A ``where`` that touches nullable columns is compiled (in ``NullQueryPlan``)
+# to a small three-valued AST.  Comparison leaves are evaluated against the
+# logical masked array, so their semantics are exactly pandas' (dtype
+# boundaries, ``2**53`` neighbours, ``True == 1``, out-of-range scalars, NaN).
+# Leaves that are safe for PyTables' own index (bool and in-range integer
+# scalars) are also used to narrow candidate physical blocks via
+# ``get_where_list``; the final predicate is always re-evaluated from the
+# payload + validity pair, so the index can only ever be a (sound) pre-filter.
+
+_NULLABLE_LAYOUT_ATTR: Final = "nullable_layout"
+_NULLABLE_LAYOUT_VERSION: Final = 1
+_NULLABLE_VALID_SUFFIX: Final = "__valid"
+
+_NULLABLE_DTYPES: Final = frozenset(
+    [
+        "Int8",
+        "Int16",
+        "Int32",
+        "Int64",
+        "UInt8",
+        "UInt16",
+        "UInt32",
+        "UInt64",
+        "boolean",
+    ]
+)
+
+
+def _is_nullable_dtype(dtype) -> bool:
+    """return True if dtype is one of the supported masked extension dtypes"""
+    if not isinstance(dtype, BaseMaskedDtype):
+        return False
+    return str(dtype) in _NULLABLE_DTYPES
+
+
+def _nullable_payload_atom(dtype) -> str:
+    """return the PyTables atom class name for the payload of ``dtype``"""
+    np_dtype = dtype.numpy_dtype
+    if np_dtype == np.bool_:
+        return "BoolCol"
+    kind = np_dtype.kind
+    name = np_dtype.name
+    if kind == "i":
+        return f"Int{np_dtype.itemsize * 8}Col"
+    elif kind == "u":
+        return f"UInt{np_dtype.itemsize * 8}Col"
+    raise ValueError(f"unsupported nullable dtype [{name}]")
+
+
+class _NullableFieldError(ValueError):
+    """raised when the nullable layout metadata is missing / conflicting"""
+
+
+def _valid_field_name(name: str) -> str:
+    return f"{name}{_NULLABLE_VALID_SUFFIX}"
+
+
+def _encode_nullable_layout(schema: dict[str, dict[str, Any]]) -> str:
+    return json.dumps(
+        {"version": _NULLABLE_LAYOUT_VERSION, "columns": schema}, sort_keys=True
+    )
+
+
+def _decode_nullable_layout(raw) -> dict[str, dict[str, Any]]:
+    """
+    Decode & validate the nullable layout description stored on the table.
+
+    Raises
+    ------
+    _NullableFieldError
+        if the version is unknown or the description is malformed.
+    """
+    raw = _ensure_decoded(raw)
+    try:
+        doc = json.loads(raw)
+    except (TypeError, ValueError) as err:
+        raise _NullableFieldError(
+            f"corrupt nullable column layout metadata: {raw!r}"
+        ) from err
+    if not isinstance(doc, dict):
+        raise _NullableFieldError(f"corrupt nullable column layout metadata: {raw!r}")
+    version = doc.get("version")
+    if version != _NULLABLE_LAYOUT_VERSION:
+        raise _NullableFieldError(
+            f"unsupported nullable column layout version [{version}], "
+            f"this version of pandas understands version "
+            f"[{_NULLABLE_LAYOUT_VERSION}]"
+        )
+    columns = doc.get("columns")
+    if not isinstance(columns, dict):
+        raise _NullableFieldError(f"corrupt nullable column layout metadata: {raw!r}")
+    for name, entry in columns.items():
+        if not isinstance(entry, dict):
+            raise _NullableFieldError(f"corrupt nullable column [{name}] layout")
+        for key in ("payload", "valid", "dtype"):
+            if key not in entry:
+                raise _NullableFieldError(
+                    f"nullable column [{name}] is missing its [{key}] mapping"
+                )
+        if entry["dtype"] not in _NULLABLE_DTYPES:
+            raise _NullableFieldError(
+                f"nullable column [{name}] has unknown dtype [{entry['dtype']}]"
+            )
+        entry.setdefault("queryable", False)
+    return columns
+
+
+def _read_nullable_layout(attrs) -> dict[str, dict[str, Any]]:
+    """read the nullable layout from a table node, {} when absent"""
+    raw = getattr(attrs, _NULLABLE_LAYOUT_ATTR, None)
+    if raw is None:
+        return {}
+    return _decode_nullable_layout(raw)
+
+
+class NullableColumn(DataCol):
+    """
+    a nullable (masked) logical column stored as a payload field plus a
+    validity field, but not exposed as a physical data column
+    """
+
+    is_nullable = True
+
+    def __init__(
+        self,
+        *args,
+        valid_typ=None,
+        logical_dtype=None,
+        valid_name: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.valid_typ = valid_typ
+        self.logical_dtype = logical_dtype
+        # the physical validity field name is supplied explicitly (it may differ
+        # from ``<cname>__valid`` when a user column would otherwise collide)
+        self._valid_name = valid_name or _valid_field_name(self.cname)
+
+    @property
+    def valid_cname(self) -> str:
+        return self._valid_name
+
+    @property
+    def valid_col(self):
+        return getattr(self.description, self.valid_cname, None)
+
+    def validate_attr(self, append: bool) -> None:
+        if append:
+            existing_dtype = getattr(self.attrs, self.dtype_attr, None)
+            if existing_dtype is not None and existing_dtype != self.dtype:
+                raise ValueError(
+                    "appended items dtype do not match existing items dtype in table!"
+                )
+
+    def convert(self, values: np.ndarray, nan_rep, encoding: str, errors: str):
+        return _convert_nullable(
+            values, self.name, self.cname, self.valid_cname, self.logical_dtype
+        )
+
+
+class NullableDataCol(NullableColumn):
+    """a nullable column which is also a physical data column"""
+
+    is_data_indexable = True
+
+
+def _convert_nullable(
+    values: np.ndarray,
+    name: str,
+    payload_name: str,
+    valid_name: str,
+    logical_dtype: str,
+):
+    """
+    Rebuild the logical masked array from the payload & validity fields.
+
+    The result is always a pandas :class:`BaseMaskedArray` of the logical
+    dtype; missingness comes exclusively from the validity field.
+    """
+    if values.dtype.fields is not None:
+        payload = values[payload_name]
+        valid = values[valid_name]
+    else:  # pragma: no cover - defensive
+        payload = values
+        valid = np.ones(len(payload), dtype=bool)
+
+    dtype = pandas_dtype(logical_dtype)
+    payload = np.asarray(payload, dtype=dtype.numpy_dtype)
+    mask = ~np.asarray(valid, dtype=bool)
+
+    # build the masked array directly from the payload & mask; never route
+    # missing entries through the payload value
+    if dtype.name == "boolean":
+        converted = BooleanArray(payload, mask)
+    else:
+        converted = IntegerArray(payload, mask)
+    return [name], converted
+
+
+# ---------------------------------------------------------------------------
+# three-valued (Kleene) query evaluation over nullable columns
+# ---------------------------------------------------------------------------
+
+
+class _NullQueryError(ValueError):
+    """raised for invalid where expressions over nullable columns"""
+
+
+# the symbolic result of a nullable predicate: an int8 array with
+#   1  -> True
+#   0  -> False
+#  -1  -> unknown (missing)
+_UNKNOWN: Final = np.int8(-1)
+
+# prefix pandas' expression scope uses for ``@local`` variables
+_LOCAL_TAG: Final = "__pd_eval_local_"
+
+_CMP_AST_TO_SYMBOL = {
+    ast.Lt: "<",
+    ast.LtE: "<=",
+    ast.Gt: ">",
+    ast.GtE: ">=",
+    ast.Eq: "==",
+    ast.NotEq: "!=",
+}
+
+
+class NullQueryPlan:
+    """
+    A compiled ``where`` plan for tables that contain nullable columns.
+
+    A plan is a small AST whose leaves are either
+
+    * comparisons of a nullable logical column against a scalar,
+    * ``isna()`` / ``notna()`` tests on a nullable column,
+    * ordinary PyTables conditions (for any other queryable column), or
+    * boolean constants,
+
+    combined with ``and`` / ``or`` / ``not``.  Evaluation is three-valued
+    (True / False / unknown) and follows pandas' ``BooleanArray`` Kleene
+    semantics: a comparison against a missing entry is unknown, ``not`` of
+    unknown is unknown, and ``unknown OR True`` is True.
+
+    Only rows whose combined predicate is *True* are turned into physical
+    coordinates.  Evaluation is chunked along the physical table chunk length
+    so the working set is proportional to the chunk, never the table.
+    """
+
+    def __init__(self, table: Table, where, start=None, stop=None) -> None:
+        self.table = table
+        self.where = where
+        self.start = start
+        self.stop = stop
+        self.nullable = table._nullable_layout
+        chunkshape = table.table.chunkshape
+        self.chunklen = int(chunkshape[0]) if chunkshape else 65536
+        self.expr = self._parse(where)
+
+    # -- construction ------------------------------------------------------
+    def _parse(self, where):
+        if isinstance(where, (list, tuple)):
+            parts = [self._parse(w) for w in where if w is not None]
+            if not parts:
+                return None
+            expr = parts[0]
+            for p in parts[1:]:
+                expr = ("and", expr, p)
+            return expr
+        if where is None:
+            return None
+        if isinstance(where, PyTablesExpr):
+            source = where.expr
+        elif isinstance(where, str):
+            source = where
+        else:
+            raise _NullQueryError(f"invalid where expression [{where!r}]")
+        queryables = set(self.table.queryables())
+        parser = _NullableExprParser(source, queryables, set(self.nullable))
+        return parser.parse()
+
+    # -- evaluation --------------------------------------------------------
+    @property
+    def is_trivial(self) -> bool:
+        return self.expr is None
+
+    def _range(self) -> tuple[int, int]:
+        nrows = self.table.nrows
+        start = self.start
+        stop = self.stop
+        if start is None:
+            start = 0
+        elif start < 0:
+            start += nrows
+        if stop is None:
+            stop = nrows
+        elif stop < 0:
+            stop += nrows
+        return max(0, start), min(nrows, stop)
+
+    def select_coords(self) -> np.ndarray:
+        """physical coordinates of the rows whose predicate is exactly True"""
+        start, stop = self._range()
+        if self.expr is None:
+            return np.arange(start, stop)
+
+        candidates = self._candidate_coords()
+        if candidates is not None and not len(candidates):
+            return np.array([], dtype=np.intp)
+
+        if candidates is None:
+            # no indexed narrowing is possible: evaluate every chunk
+            ranges = [
+                (c, min(c + self.chunklen, stop))
+                for c in range(start, stop, self.chunklen)
+            ]
+            cand_chunks: list[np.ndarray] | None = None
+        else:
+            # only the chunks that contain candidates need their payload /
+            # validity columns read; group the candidates by chunk
+            chunk_ids = (candidates - start) // self.chunklen
+            uniq = np.unique(chunk_ids)
+            ranges = []
+            cand_chunks = []
+            for cid in uniq:
+                cstart = int(start + cid * self.chunklen)
+                cstop = min(cstart + self.chunklen, stop)
+                ranges.append((cstart, cstop))
+                cand_chunks.append(
+                    candidates[(candidates >= cstart) & (candidates < cstop)]
+                )
+
+        coords: list[np.ndarray] = []
+        for i, (cstart, cstop) in enumerate(ranges):
+            result = self._evaluate(self.expr, cstart, cstop)
+            take = np.asarray(result == 1, dtype=bool)
+            local = np.arange(cstart, cstop)[take]
+            if cand_chunks is not None:
+                local = np.intersect1d(local, cand_chunks[i], assume_unique=True)
+            if local.size:
+                coords.append(local)
+        if not coords:
+            return np.array([], dtype=np.intp)
+        return np.concatenate(coords)
+
+    def iter_coords(self, start: int, stop: int) -> Iterator[np.ndarray]:
+        """
+        Yield the matching physical coordinates chunk by chunk.
+
+        The working set is bounded by one table chunk: candidates, payloads and
+        validity masks are all read for the current chunk only.  This is the
+        streaming entry point used by ``chunksize=`` / ``iterator=True`` so
+        that iteration never materializes the whole key's hits.
+        """
+        if self.expr is None:
+            for cstart in range(start, stop, self.chunklen):
+                yield np.arange(cstart, min(cstart + self.chunklen, stop))
+            return
+        for cstart in range(start, stop, self.chunklen):
+            cstop = min(cstart + self.chunklen, stop)
+            cand = self._candidates(self.expr, cstart, cstop)
+            if cand is not None and not len(cand):
+                continue
+            result = self._evaluate(self.expr, cstart, cstop)
+            take = np.asarray(result == 1, dtype=bool)
+            local = np.arange(cstart, cstop)[take]
+            if cand is not None:
+                local = np.intersect1d(local, cand, assume_unique=True)
+            if local.size:
+                yield local
+
+    def _candidate_coords(self) -> np.ndarray | None:
+        """
+        A superset of the coordinates whose predicate may be True.
+
+        ``None`` means "no narrowing is possible" (the whole requested range
+        is a candidate).  Leaf comparisons against an indexed nullable payload
+        use PyTables' on-disk index (through ``get_where_list``), so a selective
+        equality query only touches the table blocks that can contain hits.
+        """
+        start, stop = self._range()
+        return self._candidates(self.expr, start, stop)
+
+    def _candidates(self, node, start, stop) -> np.ndarray | None:
+        kind = node[0]
+        universe = None
+        if kind == "const":
+            if node[1] is False:
+                return np.array([], dtype=np.intp)
+            return universe
+        if kind in ("isna", "notna"):
+            column = node[1].name if isinstance(node[1], _ColumnRef) else node[1]
+            layout = self.nullable.get(column)
+            if layout is None:
+                return universe
+            condition = (
+                f"({layout['valid']} == False)"
+                if kind == "isna"
+                else f"({layout['valid']} == True)"
+            )
+            try:
+                return np.asarray(
+                    self.table.table.get_where_list(
+                        condition, start=start, stop=stop, sort=True
+                    ),
+                    dtype=np.intp,
+                )
+            except Exception:
+                return universe
+        if kind == "not":
+            # the True set of a negation is not directly indexable
+            return universe
+        if kind == "and":
+            left = self._candidates(node[1], start, stop)
+            right = self._candidates(node[2], start, stop)
+            if left is None:
+                return right
+            if right is None:
+                return left
+            return np.intersect1d(left, right, assume_unique=True)
+        if kind == "or":
+            left = self._candidates(node[1], start, stop)
+            right = self._candidates(node[2], start, stop)
+            if left is None or right is None:
+                return universe
+            return np.union1d(left, right)
+        if kind == "cmp":
+            _, lhs, op, rhs = node
+            column, norm_op, scalar = _orient_cmp(lhs, op, rhs)
+            if column is not None and column in self.nullable:
+                return self._nullable_cmp_candidates(
+                    column, norm_op, scalar, start, stop
+                )
+            condition = _format_pytables_condition(lhs, op, rhs)
+            try:
+                if not self.table.table.will_query_use_indexing(condition):
+                    return universe
+                return np.asarray(
+                    self.table.table.get_where_list(
+                        condition, start=start, stop=stop, sort=True
+                    ),
+                    dtype=np.intp,
+                )
+            except Exception:
+                return universe
+        return universe
+
+    def _nullable_cmp_candidates(self, column, op, scalar, start, stop):
+        """
+        Index-narrow the candidate coordinates for a nullable comparison.
+
+        Narrowing is only attempted for scalar types whose on-disk comparison
+        PyTables evaluates exactly: booleans and integers that fit the payload
+        dtype.  Float scalars (which PyTables may round near ``2**53``) and
+        out-of-range integers fall back to a full scan, so the candidate set is
+        always a safe superset of the exact result.
+        """
+        layout = self.nullable[column]
+        dtype = pandas_dtype(layout["dtype"])
+        valid_cname = layout["valid"]
+        if dtype.name == "boolean" and op not in ("==", "!="):
+            raise _NullQueryError("boolean columns only support == and != comparisons")
+
+        use_index = False
+        if dtype.name == "boolean":
+            if isinstance(scalar, (bool, np.bool_)):
+                literal = "True" if bool(scalar) else "False"
+                use_index = True
+        elif isinstance(scalar, (bool, np.bool_)):
+            # comparing an integer column to a bool: PyTables is exact
+            literal = "1" if bool(scalar) else "0"
+            use_index = True
+        elif isinstance(scalar, (int, np.integer)):
+            info = np.iinfo(dtype.numpy_dtype)
+            if int(info.min) <= int(scalar) <= int(info.max):
+                literal = str(int(scalar))
+                use_index = True
+
+        col = getattr(self.table.table.cols, layout["payload"], None)
+        if not use_index or col is None or not col.is_indexed:
+            return None
+
+        condition = f"(({layout['payload']} {op} {literal}) & ({valid_cname} == True))"
+        try:
+            return np.asarray(
+                self.table.table.get_where_list(
+                    condition, start=start, stop=stop, sort=True
+                ),
+                dtype=np.intp,
+            )
+        except Exception:
+            return None
+
+    def _evaluate(self, node, start, stop):
+        kind = node[0]
+        if kind == "const":
+            value = node[1]
+            if value is True:
+                return np.ones(stop - start, dtype=np.int8)
+            if value is False:
+                return np.zeros(stop - start, dtype=np.int8)
+            return np.full(stop - start, _UNKNOWN, dtype=np.int8)
+        if kind == "cmp":
+            return self._evaluate_cmp(node, start, stop)
+        if kind in ("and", "or"):
+            left = self._evaluate(node[1], start, stop)
+            right = self._evaluate(node[2], start, stop)
+            return (
+                _kleene_and(left, right) if kind == "and" else _kleene_or(left, right)
+            )
+        if kind == "not":
+            return _kleene_not(self._evaluate(node[1], start, stop))
+        if kind == "isna":
+            return self._evaluate_isna(node[1], start, stop, negate=False)
+        if kind == "notna":
+            return self._evaluate_isna(node[1], start, stop, negate=True)
+        if kind == "pytables":
+            out = np.zeros(stop - start, dtype=np.int8)
+            condition = node[1]
+            if condition is None:
+                out[:] = 1
+                return out
+            try:
+                coords = self.table.table.get_where_list(
+                    condition, start=start, stop=stop, sort=True
+                )
+            except TypeError:
+                # e.g. string payloads are compared as bytes; retry by encoding
+                coords = self.table.table.get_where_list(
+                    self._encode_string_condition(condition, start, stop),
+                    start=start,
+                    stop=stop,
+                    sort=True,
+                )
+            if len(coords):
+                out[np.asarray(coords, dtype=np.intp) - start] = 1
+            return out
+        raise _NullQueryError(f"unsupported where expression node [{kind}]")
+
+    def _load(self, physical, start, stop):
+        return self.table.table.cols._f_col(physical)[start:stop]
+
+    def _encode_string_condition(self, condition, start, stop):
+        """
+        Rewrite string literals in a PyTables condition as bytes.
+
+        PyTables compares fixed-length string fields as ``bytes``; a plain
+        ``"x"`` literal may raise a ``TypeError`` against a bytes column, so we
+        encode any quoted literal and retry.
+
+        """
+
+        def repl(match):
+            body = match.group(1)
+            return 'b"' + body + '"'
+
+        return re.sub(r'"([^"]*)"', repl, condition)
+
+    def _evaluate_isna(self, ref, start, stop, negate: bool):
+        column = ref.name if isinstance(ref, _ColumnRef) else ref
+        layout = self.nullable.get(column)
+        if layout is None:
+            raise _NullQueryError(
+                f"column [{column}] is not a nullable column; isna()/notna() "
+                "is only supported on nullable columns"
+            )
+        valid = np.asarray(self._load(layout["valid"], start, stop), dtype=bool)
+        out = (
+            np.ones(stop - start, dtype=np.int8)
+            if negate
+            else np.zeros(stop - start, dtype=np.int8)
+        )
+        if negate:
+            out[valid] = 1
+            out[~valid] = 0
+        else:
+            out[valid] = 0
+            out[~valid] = 1
+        return out
+
+    def _evaluate_cmp(self, node, start, stop):
+        _, lhs, op, rhs = node
+        column, norm_op, scalar = _orient_cmp(lhs, op, rhs)
+        if column is not None and column in self.nullable:
+            return self._evaluate_nullable_cmp(column, norm_op, scalar, start, stop)
+        condition = _format_pytables_condition(lhs, op, rhs)
+        return self._evaluate(("pytables", condition), start, stop)
+
+    def _evaluate_nullable_cmp(self, column, op, scalar, start, stop):
+        layout = self.nullable[column]
+        dtype = pandas_dtype(layout["dtype"])
+        if dtype.name == "boolean" and op not in ("==", "!="):
+            raise _NullQueryError("boolean columns only support == and != comparisons")
+        n = stop - start
+        valid = np.asarray(self._load(layout["valid"], start, stop), dtype=bool)
+        payload = np.asarray(self._load(layout["payload"], start, stop))
+        payload = payload.astype(dtype.numpy_dtype, copy=False)
+        mask = ~valid
+
+        # Delegate the scalar comparison to pandas' own masked array so the
+        # exact dtype-boundary / float / boolean semantics match a logical
+        # ``column <op> scalar`` evaluation (including "True == 1", integer
+        # scalars beyond the dtype range, and 2**53 neighbourhood rounding).
+        if dtype.name == "boolean":
+            logical = BooleanArray(payload, mask)
+        else:
+            logical = IntegerArray(payload, mask)
+
+        opfunc = _CMP_FUNCS[op]
+        result = opfunc(logical, scalar)
+        # result is a BooleanArray; its mask is exactly the original validity
+        data = np.asarray(result._data, dtype=bool)
+        unknown = np.asarray(result._mask, dtype=bool)
+
+        out = np.full(n, _UNKNOWN, dtype=np.int8)
+        out[~unknown] = data[~unknown].astype(np.int8)
+        return out
+
+
+class _NullableExprParser:
+    """turn a where string into the plan AST used by :class:`NullQueryPlan`"""
+
+    def __init__(
+        self, source: str, queryables: set[str], nullable: set[str] | None = None
+    ) -> None:
+        self.source = source
+        self.queryables = frozenset(queryables)
+        self.nullable = frozenset(nullable or ())
+
+    def parse(self):
+        clean = _preparse(self.source)
+        tree = ast.parse(clean).body[0].value
+        return self._visit(tree)
+
+    def _visit(self, node):
+        if isinstance(node, ast.BoolOp):
+            parts = [self._visit(v) for v in node.values]
+            op_kind = "and" if isinstance(node.op, ast.And) else "or"
+            out = parts[0]
+            for p in parts[1:]:
+                out = (op_kind, out, p)
+            return out
+        if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, (ast.Invert, ast.Not)):
+                return ("not", self._visit(node.operand))
+            raise _NullQueryError("unary +/- is not supported in where")
+        if isinstance(node, ast.Compare):
+            if len(node.ops) != 1:
+                raise _NullQueryError("chained comparisons are not supported in where")
+            if type(node.ops[0]) not in _CMP_AST_TO_SYMBOL:
+                raise _NullQueryError(
+                    "only ==, !=, <, <=, > and >= comparisons are supported "
+                    "in where against nullable columns"
+                )
+            op = _CMP_AST_TO_SYMBOL[type(node.ops[0])]
+            return self._cmp(node.left, op, node.comparators[0])
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd):
+            return ("and", self._visit(node.left), self._visit(node.right))
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitOr):
+            return ("or", self._visit(node.left), self._visit(node.right))
+        if isinstance(node, ast.Call):
+            return self._call(node)
+        value = self._const(node)
+        if isinstance(value, (bool, np.bool_)):
+            return ("const", bool(value))
+        raise _NullQueryError(f"unsupported where expression [{self.source!r}]")
+
+    def _cmp(self, left, op, right):
+        left = self._maybe_name(left)
+        right = self._maybe_name(right)
+        if isinstance(left, list) or isinstance(right, list):
+            raise _NullQueryError("membership tests are not supported in where")
+        return ("cmp", left, op, right)
+
+    def _maybe_name(self, node):
+        if isinstance(node, ast.Name):
+            if node.id in self.queryables:
+                return _ColumnRef(node.id)
+            if node.id in self.nullable:
+                raise _NullQueryError(
+                    f"column [{node.id}] is a nullable column but is not "
+                    "declared as a data_column; reload the frame into "
+                    "HDFStore and include it with the data_columns argument "
+                    "to query it"
+                )
+            # a free name (e.g. a caller-bound scalar) is resolved from scope
+            local = node.id
+            if local.startswith(_LOCAL_TAG):
+                local = local[len(_LOCAL_TAG) :]
+            return _resolve_scope_value(local)
+        if isinstance(node, ast.Call):
+            return self._call(node)
+        if isinstance(node, ast.Attribute):
+            return self._dotted(node)
+        return self._const(node)
+
+    def _dotted(self, node):
+        names = []
+        cur = node
+        while isinstance(cur, ast.Attribute):
+            names.append(cur.attr)
+            cur = cur.value
+        if not isinstance(cur, ast.Name):
+            raise _NullQueryError("unsupported attribute access in where")
+        root = cur.id
+        if root.startswith(_LOCAL_TAG):
+            root = root[len(_LOCAL_TAG) :]
+        names.append(root)
+        dotted = ".".join(reversed(names))
+        return _resolve_scope_value(dotted)
+
+    def _call(self, node):
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr in ("isna", "notna")
+            and not node.args
+            and not node.keywords
+            and isinstance(func.value, ast.Name)
+        ):
+            col = func.value.id
+            if col not in self.queryables:
+                raise _NullQueryError(f"column [{col}] is not queryable")
+            return ("isna" if func.attr == "isna" else "notna", _ColumnRef(col))
+        raise _NullQueryError("unsupported function call in where")
+
+    def _const(self, node):
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
+            inner = self._const(node.operand)
+            if isinstance(inner, (int, float)) and not isinstance(inner, bool):
+                return -inner
+            raise _NullQueryError("invalid unary expression in where")
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.UAdd):
+            return self._const(node.operand)
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op, (ast.Add, ast.Sub, ast.Mult, ast.Pow, ast.FloorDiv, ast.Mod)
+        ):
+            left = self._const(node.left)
+            right = self._const(node.right)
+            if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+                if isinstance(node.op, ast.Add):
+                    return left + right
+                if isinstance(node.op, ast.Sub):
+                    return left - right
+                if isinstance(node.op, ast.Mult):
+                    return left * right
+                if isinstance(node.op, ast.Pow):
+                    return left**right
+                if isinstance(node.op, ast.FloorDiv):
+                    return left // right
+                if isinstance(node.op, ast.Mod):
+                    return left % right
+            raise _NullQueryError("unsupported arithmetic in where")
+        if isinstance(node, ast.List):
+            return [self._const(e) for e in node.elts]
+        if isinstance(node, ast.Tuple):
+            return tuple(self._const(e) for e in node.elts)
+        if isinstance(node, ast.Subscript):
+            # e.g. ``selection.index[0]``: resolve via the caller's scope
+            base = self._maybe_name(node.value)
+            index = self._const(node.slice)
+            return base[index]
+        if isinstance(node, ast.Attribute):
+            return self._dotted(node)
+        raise _NullQueryError("unsupported constant in where")
+
+
+def _resolve_scope_value(dotted: str):
+    """resolve a (possibly dotted) name from the caller's frames"""
+    parts = dotted.split(".")
+    sentinel = object()
+    obj = sentinel
+    for frameinfo in inspect.stack()[2:]:
+        frame = frameinfo.frame
+        if parts[0] in frame.f_locals:
+            obj = frame.f_locals[parts[0]]
+            break
+        if parts[0] in frame.f_globals:
+            obj = frame.f_globals[parts[0]]
+            break
+    if obj is sentinel:
+        raise _NullQueryError(f"cannot resolve [{dotted}] in where")
+    for p in parts[1:]:
+        obj = getattr(obj, p)
+    return obj
+
+
+class _ColumnRef:
+    """a queryable column reference in a parsed where expression"""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"ColumnRef({self.name!r})"
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _ColumnRef) and other.name == self.name
+
+    def __hash__(self) -> int:
+        return hash(self.name)
+
+
+def _orient_cmp(lhs, op, rhs):
+    """return (nullable_column_name, scalar) with operands normalised"""
+    if isinstance(lhs, _ColumnRef):
+        column, scalar = lhs.name, rhs
+        norm_op = op
+    elif isinstance(rhs, _ColumnRef):
+        column, scalar = rhs.name, lhs
+        norm_op = _FLIP_OP[op]
+    else:
+        return None, None, None
+    if isinstance(scalar, _ColumnRef):
+        return None, None, None
+    return column, norm_op, scalar
+
+
+def _format_scalar(value) -> str:
+    if isinstance(value, (bool, np.bool_)):
+        return "True" if value else "False"
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        return repr(float(value))
+    if isinstance(value, str):
+        escaped = value.replace(chr(92), chr(92) * 2).replace('"', chr(92) + '"')
+        return f'"{escaped}"'
+    raise _NullQueryError(f"cannot compare a column to [{value!r}] in where")
+
+
+def _format_pytables_condition(lhs, op, rhs) -> str:
+    if isinstance(lhs, _ColumnRef):
+        if isinstance(rhs, _ColumnRef):
+            raise _NullQueryError(
+                "column-to-column comparisons are not supported in where"
+            )
+        return f"({lhs.name} {op} {_format_scalar(rhs)})"
+    if isinstance(rhs, _ColumnRef):
+        return f"({rhs.name} {_FLIP_OP[op]} {_format_scalar(lhs)})"
+    raise _NullQueryError("invalid comparison in where expression")
+
+
+_CMP_FUNCS = {
+    "==": operator.eq,
+    "!=": operator.ne,
+    "<": operator.lt,
+    "<=": operator.le,
+    ">": operator.gt,
+    ">=": operator.ge,
+}
+
+_FLIP_OP = {"<": ">", ">": "<", "<=": ">=", ">=": "<=", "==": "==", "!=": "!="}
+
+
+def _kleene_and(left, right):
+    out = np.full(len(left), _UNKNOWN, dtype=np.int8)
+    false = (left == 0) | (right == 0)
+    true = (left == 1) & (right == 1)
+    out[false] = 0
+    out[true] = 1
+    return out
+
+
+def _kleene_or(left, right):
+    out = np.full(len(left), _UNKNOWN, dtype=np.int8)
+    true = (left == 1) | (right == 1)
+    false = (left == 0) & (right == 0)
+    out[true] = 1
+    out[false] = 0
+    return out
+
+
+def _kleene_not(values):
+    out = np.full(len(values), _UNKNOWN, dtype=np.int8)
+    out[values == 0] = 1
+    out[values == 1] = 0
+    return out
 
 
 class Fixed:
@@ -3467,6 +4434,66 @@ class Table(Fixed):
     def table_type_short(self) -> str:
         return self.table_type.split("_")[0]
 
+    @property
+    def _layout_attrs(self):
+        """
+        The node carrying the nullable-layout metadata.
+
+        The description is attached to the PyTables table node so that the
+        logical/physical mapping lives right next to the physical columns it
+        describes.  For a storer that does not (yet) have a table, fall back to
+        the group attributes.
+        """
+        storable = self.storable
+        if storable is not None and storable is not self.group:
+            return storable._v_attrs
+        return self.attrs
+
+    @property
+    def _nullable_layout(self) -> dict[str, dict[str, Any]]:
+        """
+        The logical -> physical map for nullable columns, {} if none.
+
+        This is read from (and validated against) the table attributes.
+        """
+        return _read_nullable_layout(self._layout_attrs)
+
+    def _collect_nullable_layout(self) -> dict[str, dict[str, Any]]:
+        """collect the layout from the (possibly new) value axes"""
+        layout = dict(self._nullable_layout)
+        for a in self.values_axes:
+            if getattr(a, "is_nullable", False):
+                layout[a.name] = {
+                    "payload": a.cname,
+                    "valid": a.valid_cname,
+                    "dtype": a.logical_dtype,
+                    "queryable": a.is_data_indexable,
+                }
+        return layout
+
+    def _unique_valid_name(
+        self,
+        name: str,
+        layout: dict[str, dict[str, Any]],
+        reserved: set[str],
+    ) -> str:
+        """
+        Pick a physical validity-field name disjoint from every user column and
+        auxiliary field in this table.
+
+        The default is ``<name>__valid``.  If a user column (or an existing
+        auxiliary field) already uses that name, underscores are appended until
+        the name is unique, so a user column called e.g. ``a__valid`` can never
+        be confused with the validity field of ``a``.
+        """
+        taken = set(reserved)
+        taken.update(entry["payload"] for entry in layout.values())
+        taken.update(entry["valid"] for entry in layout.values())
+        candidate = _valid_field_name(name)
+        while candidate in taken:
+            candidate = f"{candidate}_"
+        return candidate
+
     def __repr__(self) -> str:
         """return a pretty representation of myself"""
         self.infer_axes()
@@ -3668,6 +4695,9 @@ class Table(Fixed):
         self.attrs.levels = self.levels
         self.attrs.info = self.info
 
+        # the nullable layout is written by ``write`` once the table node
+        # exists (``set_attrs`` runs before ``create_table``).
+
     def get_attrs(self) -> None:
         """retrieve our attributes"""
         self.non_index_axes = getattr(self.attrs, "non_index_axes", None) or []
@@ -3719,6 +4749,24 @@ class Table(Fixed):
 
         desc = self.description
         table_attrs = self.table.attrs
+
+        nullable_layout = self._nullable_layout
+        # physical (payload) fields belonging to nullable columns are represented
+        # by NullableDataCol below, and their validity fields are not axes.
+        nullable_payloads = {v["payload"] for v in nullable_layout.values()}
+        nullable_valid = {v["valid"] for v in nullable_layout.values()}
+        if nullable_layout:
+            for entry in nullable_layout.values():
+                if entry["payload"] not in desc._v_names:
+                    raise _NullableFieldError(
+                        f"nullable column layout references missing physical "
+                        f"field [{entry['payload']}]"
+                    )
+                if entry["valid"] not in desc._v_names:
+                    raise _NullableFieldError(
+                        f"nullable column layout references missing validity "
+                        f"field [{entry['valid']}]"
+                    )
 
         # Note: each of the `name` kwargs below are str, ensured
         #  by the definition in index_cols.
@@ -3783,8 +4831,42 @@ class Table(Fixed):
             return obj
 
         # Note: the definition of `values_cols` ensures that each
-        #  `c` below is a str.
-        _indexables.extend([f(i, c) for i, c in enumerate(self.attrs.values_cols)])
+        #  `c` below is a str.  Nullable payload fields are rebuilt explicitly
+        #  below and must not be treated as ordinary value blocks.
+        values_cols = [
+            c
+            for c in self.attrs.values_cols
+            if c not in nullable_valid and c not in nullable_payloads
+        ]
+        _indexables.extend([f(i, c) for i, c in enumerate(values_cols)])
+
+        # nullable columns: their payload is a physical field.  They are
+        # rebuilt explicitly with their validity field attached; only those
+        # recorded as ``queryable`` are exposed as (indexable) data columns.
+        pos = base_pos + len(values_cols)
+        for name, entry in nullable_layout.items():
+            payload = entry["payload"]
+            atom = getattr(desc, payload)
+            valid_atom = getattr(desc, entry["valid"])
+            dtype = entry["dtype"]
+            klass = NullableDataCol if entry.get("queryable") else NullableColumn
+            obj = klass(
+                name=name,
+                cname=payload,
+                values=[name],
+                kind="integer" if dtype != "boolean" else "bool",
+                pos=pos,
+                typ=atom,
+                valid_typ=valid_atom,
+                valid_name=entry["valid"],
+                logical_dtype=dtype,
+                table=self.table,
+                meta=None,
+                metadata=None,
+                dtype=dtype,
+            )
+            pos += 1
+            _indexables.append(obj)
 
         return _indexables
 
@@ -3836,6 +4918,9 @@ class Table(Fixed):
             kw["kind"] = kind
 
         table = self.table
+        fallback: list[str] = list(
+            getattr(self.attrs, "nullable_index_fallback", None) or []
+        )
         for c in columns:
             v = getattr(table.cols, c, None)
             if v is not None:
@@ -3865,6 +4950,13 @@ class Table(Fixed):
                             "the columns containing complex values to "
                             "data_columns when initializing the table."
                         )
+                    if v.type == "uint64":
+                        # PyTables has no 64-bit unsigned integer index.  We
+                        # deliberately fall back to a scan of candidate blocks
+                        # (recorded so that readers can plan accordingly).
+                        if c not in fallback:
+                            fallback.append(c)
+                        continue
                     v.create_index(**kw)
             elif c in self.non_index_axes[0][1]:
                 # GH 28156
@@ -3873,6 +4965,8 @@ class Table(Fixed):
                     f"In order to read column {c} you must reload the dataframe \n"
                     f"into HDFStore and include {c} with the data_columns argument."
                 )
+        if fallback:
+            self.attrs.nullable_index_fallback = fallback
 
     def _read_axes(
         self, where, start: int | None = None, stop: int | None = None
@@ -4085,9 +5179,55 @@ class Table(Fixed):
 
         frame = self.get_object(obj, transposed)._consolidate()
 
+        # all nullable labels in the frame (these get their own physical
+        # payload + validity fields) and the subset that was explicitly
+        # declared as data_columns (only those may be used in ``where``).
+        seen: set[Any] = set()
+        nullable_labels = []
+        for label, dtype in frame.dtypes.items():
+            if label in seen:
+                continue
+            seen.add(label)
+            if (
+                isinstance(label, str)
+                and _is_nullable_dtype(dtype)
+                and list(frame.columns).count(label) == 1
+            ):
+                nullable_labels.append(label)
+        nullable_queryable = set(data_columns).intersection(nullable_labels)
+        nullable_blocks = set(nullable_labels)
+
+        existing_plain_axes = [
+            a for a in self.values_axes if not getattr(a, "is_nullable", False)
+        ]
         blocks, blk_items = self._get_blocks_and_items(
-            frame, table_exists, new_non_index_axes, self.values_axes, data_columns
+            frame,
+            table_exists,
+            new_non_index_axes,
+            existing_plain_axes,
+            [c for c in data_columns if c not in nullable_blocks],
         )
+
+        # existing nullable layout (if this table already exists)
+        nullable_layout: dict[str, dict[str, Any]] = {}
+        if table_exists:
+            nullable_layout = dict(self._nullable_layout)
+
+        # drop blocks that consist solely of nullable columns; they are handled
+        # one physical field per logical column below.
+        plain_blocks = []
+        plain_items = []
+        for blk, b_items in zip(blocks, blk_items):
+            if len(b_items) == 1 and b_items[0] in nullable_blocks:
+                continue
+            if any(item in nullable_blocks for item in b_items):
+                raise ValueError(
+                    "nullable columns cannot be stored together with other "
+                    "columns in a single block"
+                )
+            plain_blocks.append(blk)
+            plain_items.append(b_items)
+        blocks, blk_items = plain_blocks, plain_items
 
         # add my values
         vaxes = []
@@ -4167,6 +5307,84 @@ class Table(Fixed):
             vaxes.append(col)
 
             j += 1
+
+        # nullable logical columns are stored one physical block per column:
+        # a payload field plus a validity field.
+        reserved_names = {str(label) for label in frame.columns}
+        reserved_names.update(entry["payload"] for entry in nullable_layout.values())
+        reserved_names.update(entry["valid"] for entry in nullable_layout.values())
+        for name in nullable_labels:
+            existing = nullable_layout.get(name)
+            if table_exists and validate:
+                if existing is None:
+                    # a nullable column must already be known to the table
+                    raise ValueError(
+                        f"cannot append nullable column [{name}] to a table "
+                        "that does not have a matching nullable layout"
+                    )
+                if existing["dtype"] != str(frame[name].dtype):
+                    raise ValueError(
+                        f"appended items dtype do not match existing items "
+                        f"dtype in table! [{name}: {existing['dtype']} vs "
+                        f"{frame[name].dtype}]"
+                    )
+                if existing["payload"] != name:
+                    raise ValueError(
+                        f"nullable column [{name}] conflicts with existing "
+                        f"physical field [{existing['payload']}]"
+                    )
+                is_queryable = existing.get("queryable", False)
+            else:
+                is_queryable = name in nullable_queryable
+
+            values = extract_array(frame[name], extract_numpy=True)
+            payload = np.asarray(values._data, dtype=values.dtype.numpy_dtype)
+            valid = ~np.asarray(values._mask, dtype=bool)
+
+            payload_atom = getattr(_tables(), _nullable_payload_atom(values.dtype))()
+            valid_atom = _tables().BoolCol()
+            dtype_name = str(frame[name].dtype)
+
+            if existing is not None:
+                # reuse the physical validity field recorded at creation time
+                valid_name = existing["valid"]
+            else:
+                # pick a physical name disjoint from every user column and
+                # every auxiliary field already in use
+                valid_name = self._unique_valid_name(
+                    name, nullable_layout, reserved_names
+                )
+                reserved_names.add(valid_name)
+
+            # a queryable nullable column exposes its payload as a physical data
+            # column (so PyTables can index it); a non-queryable one is stored
+            # purely as a plain physical field.
+            klass = NullableDataCol if is_queryable else NullableColumn
+            col = klass(
+                name=name,
+                cname=name,
+                values=[name],
+                typ=payload_atom,
+                valid_typ=valid_atom,
+                valid_name=valid_name,
+                logical_dtype=dtype_name,
+                pos=j,
+                kind="integer" if dtype_name != "boolean" else "bool",
+                dtype=dtype_name,
+                data=payload,
+            )
+            col.valid_values = valid
+            col.update_info(new_info)
+
+            vaxes.append(col)
+            j += 1
+
+            nullable_layout[name] = {
+                "payload": name,
+                "valid": valid_name,
+                "dtype": dtype_name,
+                "queryable": is_queryable,
+            }
 
         dcs = [col.name for col in vaxes if col.is_data_indexable]
 
@@ -4331,7 +5549,13 @@ class Table(Fixed):
         d = {"name": "table", "expectedrows": expectedrows}
 
         # description from the axes & values
-        d["description"] = {a.cname: a.typ for a in self.axes}
+        description: dict[str, Any] = {}
+        for a in self.axes:
+            description[a.cname] = a.typ
+            if getattr(a, "is_nullable", False):
+                # the validity field is interleaved right after its payload
+                description[a.valid_cname] = a.valid_typ
+        d["description"] = description
 
         if complib:
             if complevel is None:
@@ -4404,15 +5628,22 @@ class Table(Fixed):
                     )
 
                 # column must be an indexable or a data column
-                c = getattr(self.table.cols, column)
+                if getattr(a, "is_nullable", False):
+                    # a nullable column spans two physical fields, so read the
+                    # whole record for the requested range
+                    c = self.table.read(start=start, stop=stop)
+                else:
+                    c = getattr(self.table.cols, column)
                 a.set_info(self.info)
                 col_values = a.convert(
-                    c[start:stop],
+                    c[start:stop] if not getattr(a, "is_nullable", False) else c,
                     nan_rep=self.nan_rep,
                     encoding=self.encoding,
                     errors=self.errors,
                 )
                 cvs = _set_tz(col_values[1], a.tz)
+                if getattr(a, "is_nullable", False):
+                    return Series(cvs, name=column, copy=False, dtype=a.dtype)
                 dtype = getattr(self.table.attrs, f"{column}_meta", None)
                 return Series(cvs, name=column, copy=False, dtype=dtype)
 
@@ -4487,6 +5718,10 @@ class AppendableTable(Table):
         for a in table.axes:
             a.validate_names()
 
+        # record the nullable layout (if any) on the storer; it is written to
+        # the table attributes below / when appending.
+        table._pending_nullable_layout = table._collect_nullable_layout()
+
         if not table.is_exists:
             # create the table
             options = table.create_description(
@@ -4503,6 +5738,16 @@ class AppendableTable(Table):
 
             # create the table
             table._handle.create_table(table.group, **options)
+            # (re)attach the nullable layout to the freshly created table node
+            if table._pending_nullable_layout:
+                table._layout_attrs.nullable_layout = _encode_nullable_layout(
+                    table._pending_nullable_layout
+                )
+        elif table._pending_nullable_layout:
+            # persisting an updated/confirmed nullable layout on append
+            table._layout_attrs.nullable_layout = _encode_nullable_layout(
+                table._pending_nullable_layout
+            )
 
         # update my info
         table.attrs.info = table.info
@@ -4518,13 +5763,22 @@ class AppendableTable(Table):
         """
         we form the data into a 2-d including indexes,values,mask write chunk-by-chunk
         """
-        names = self.dtype.names
         nrows = self.nrows_expected
+
+        # physical payload field of each value axis (their dtype layout is
+        # guaranteed to follow the value axes order in ``description``)
+        axis_fields = [a.cname for a in self.values_axes]
 
         # if dropna==True, then drop ALL nan rows
         masks = []
         if dropna:
             for a in self.values_axes:
+                if getattr(a, "is_nullable", False):
+                    # a masked column is missing exactly where its validity
+                    # field is False
+                    col_mask = ~np.asarray(a.valid_values, dtype=bool)
+                    masks.append(col_mask.astype("u1", copy=False))
+                    continue
                 # figure the mask: only do if we can successfully process this
                 # column, otherwise ignore the mask
                 mask = isna(a.data).all(axis=0)
@@ -4551,8 +5805,15 @@ class AppendableTable(Table):
         values = [v.transpose(np.roll(np.arange(v.ndim), v.ndim - 1)) for v in values]
         bvalues = []
         for i, v in enumerate(values):
-            new_shape = (nrows,) + self.dtype[names[nindexes + i]].shape
+            new_shape = (nrows,) + self.dtype[axis_fields[i]].shape
             bvalues.append(v.reshape(new_shape))
+
+        # validity masks for the nullable columns, aligned to the row axis
+        valid_masks = [
+            np.asarray(a.valid_values, dtype=bool)
+            for a in self.values_axes
+            if getattr(a, "is_nullable", False)
+        ]
 
         # write the chunks
         if chunksize is None:
@@ -4571,6 +5832,7 @@ class AppendableTable(Table):
                 indexes=[a[start_i:end_i] for a in indexes],
                 mask=mask[start_i:end_i] if mask is not None else None,
                 values=[v[start_i:end_i] for v in bvalues],
+                valid_masks=[v[start_i:end_i] for v in valid_masks],
             )
 
     def write_data_chunk(
@@ -4579,6 +5841,7 @@ class AppendableTable(Table):
         indexes: list[np.ndarray],
         mask: npt.NDArray[np.bool_] | None,
         values: list[np.ndarray],
+        valid_masks: list[np.ndarray] | None = None,
     ) -> None:
         """
         Parameters
@@ -4587,6 +5850,8 @@ class AppendableTable(Table):
         indexes : an array of the indexes
         mask : an array of the masks
         values : an array of the values
+        valid_masks : validity arrays for the nullable columns, in the same
+            order as the nullable value axes
         """
         # 0 len
         for v in values:
@@ -4606,6 +5871,14 @@ class AppendableTable(Table):
         # values
         for i, v in enumerate(values):
             rows[names[i + nindexes]] = v
+
+        # validity fields for nullable columns
+        if valid_masks:
+            for a, vm in zip(
+                [a for a in self.values_axes if getattr(a, "is_nullable", False)],
+                valid_masks,
+            ):
+                rows[a.valid_cname] = vm
 
         # mask
         if mask is not None:
@@ -4739,6 +6012,19 @@ class AppendableFrameTable(AppendableTable):
             names = info.get("names")
             if names is not None:
                 cols.set_names(names, inplace=True)
+
+            if getattr(a, "is_nullable", False):
+                # an extension (masked) column: build the frame directly from
+                # the reconstructed array, preserving the logical dtype
+                if self.is_transposed:
+                    nullable_index = cols
+                else:
+                    nullable_index = Index(index, name=getattr(index, "name", None))
+                df = DataFrame._from_arrays(
+                    [cvalues], columns=Index([a.name]), index=nullable_index
+                )
+                frames.append(df)
+                continue
 
             if self.is_transposed:
                 values = cvalues
@@ -5442,6 +6728,7 @@ class Selection:
         self.filter = None
         self.terms = None
         self.coordinates = None
+        self.null_plan: NullQueryPlan | None = None
 
         if is_list_like(where):
             # see if we have a passed coordinate like
@@ -5465,12 +6752,59 @@ class Selection:
                             )
                         self.coordinates = where
 
+        if (
+            self.coordinates is None
+            and where is not None
+            and self._uses_nullable(where)
+        ):
+            # three-valued evaluation over one or more nullable columns
+            self.null_plan = NullQueryPlan(
+                table, where, start=self.start, stop=self.stop
+            )
+            return
+
         if self.coordinates is None:
             self.terms = self.generate(where)
 
             # create the numexpr & the filter
             if self.terms is not None:
                 self.condition, self.filter = self.terms.evaluate()
+
+    def _uses_nullable(self, where) -> bool:
+        """return True when a where clause references a nullable column"""
+        nullable = set(self.table._nullable_layout)
+        if not nullable:
+            return False
+        sources: list[str] = []
+        if isinstance(where, (list, tuple)):
+            for w in where:
+                if isinstance(w, PyTablesExpr):
+                    sources.append(w.expr)
+                elif isinstance(w, str):
+                    sources.append(w)
+        elif isinstance(where, PyTablesExpr):
+            sources.append(where.expr)
+        elif isinstance(where, str):
+            sources.append(where)
+        if not sources:
+            return False
+        for src in sources:
+            try:
+                tree = ast.parse(_preparse(src))
+            except SyntaxError:
+                continue
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Name) and node.id in nullable:
+                    return True
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("isna", "notna")
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id in nullable
+                ):
+                    return True
+        return False
 
     def generate(self, where):
         """where can be a : dict,list,tuple,string"""
@@ -5499,6 +6833,9 @@ class Selection:
         """
         generate the selection
         """
+        if self.null_plan is not None:
+            coords = self.null_plan.select_coords()
+            return self.table.table.read_coordinates(coords)
         if self.condition is not None:
             return self.table.table.read_where(
                 self.condition.format(), start=self.start, stop=self.stop
@@ -5522,11 +6859,15 @@ class Selection:
         elif stop < 0:
             stop += nrows
 
+        if self.null_plan is not None:
+            return self.null_plan.select_coords().astype(np.intp, copy=False)
         if self.condition is not None:
             return self.table.table.get_where_list(
                 self.condition.format(), start=start, stop=stop, sort=True
             )
         elif self.coordinates is not None:
             return self.coordinates
+
+        return np.arange(start, stop)
 
         return np.arange(start, stop)

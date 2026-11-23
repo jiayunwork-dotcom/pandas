@@ -4773,6 +4773,85 @@ you cannot change data columns (nor indexables) after the first
 append/put operation (Of course you can simply read in the data and
 create a new table!).
 
+.. _io.hdf5-nullable-columns:
+
+Nullable integer and boolean columns
+++++++++++++++++++++++++++++++++++++
+
+The table format also supports pandas' nullable extension dtypes: ``Int8``,
+``Int16``, ``Int32``, ``Int64``, ``UInt8``, ``UInt16``, ``UInt32``, ``UInt64``
+and ``boolean``.  They round-trip with their dtype, their values, their
+missing positions, their column order and their index intact, and they may be
+freely mixed with ordinary columns in the same frame:
+
+.. ipython:: python
+
+   df_na = pd.DataFrame(
+       {
+           "a": pd.array([1, None, 3], dtype="Int64"),
+           "b": pd.array([True, False, None], dtype="boolean"),
+           "c": ["x", "y", "z"],
+       }
+   )
+   store.append("df_na", df_na, data_columns=["a", "b"])
+   store.select("df_na")
+   store.select("df_na").dtypes
+
+Unlike fixed-format stores (which pickle object arrays), the table format keeps
+these columns in a dedicated *nullable layout* that is recorded on the HDF5
+node and versioned:
+
+* the **payload** is stored as a PyTables ``Int*Col`` / ``UInt*Col`` /
+  ``BoolCol`` of exactly the logical width and signedness, and
+* a companion **validity** field (a ``BoolCol`` named ``<column>__valid``)
+  records, for every row, whether the entry is present.
+
+The payload of a missing entry is never used as a sentinel: missingness is read
+exclusively from the validity field.  The logical-to-physical mapping (including
+the layout version) is stored as a JSON document in the ``nullable_layout`` node
+attribute, so a reader that does not know a given layout version raises an error
+rather than silently mis-reading the data::
+
+   # the physical layout, as seen by PyTables
+   store.root.df_na.table
+
+Appending a frame whose nullable column has a different dtype (for example an
+``Int32`` where the table holds ``Int64``, or ``UInt64`` where it holds
+``Int64``) raises ``ValueError``; there is no implicit widening or sign change.
+The existing rows and the recorded layout are left untouched, and a subsequent
+compatible append still succeeds.
+
+A column declared as a ``data_column`` may be queried in ``where``.  All six
+comparison operators (``==``, ``!=``, ``<``, ``<=``, ``>``, ``>=``) are
+supported against a scalar of the same type; ``boolean`` columns support
+``==`` and ``!=``.  Scalar values may be literals or values bound from the
+calling scope.  Integer comparisons are exact at the dtype boundaries (and
+around ``2**53``), with no float round-off.  Null tests are expressed with
+``column.isna()`` and ``column.notna()``:
+
+.. ipython:: python
+
+   store.select("df_na", where="a >= 2")
+   store.select("df_na", where="a.isna()")
+   store.select("df_na", where="(a.isna()) | (b == True)")
+
+Queries use three-valued (Kleene) logic, matching pandas' ``BooleanArray``
+semantics: a comparison involving a missing entry is *unknown*, ``~`` of
+unknown stays unknown, and ``unknown OR True`` is ``True``.  Only rows whose
+combined predicate evaluates to *True* are returned, so a plain
+``a != 1`` does **not** select the rows where ``a`` is missing.  ``isna()`` and
+``notna()`` always yield a definite boolean.
+
+When an indexed nullable column is used in a selective equality or range
+predicate, the on-disk PyTables index is used to skip table blocks that cannot
+contain a hit.  ``UInt64`` payloads additionally use a documented block-scan
+fallback because PyTables cannot build a native 64-bit unsigned index; the
+results remain exact.
+
+Constructor-side changes: ``select_column`` returns the logical dtype, and
+projecting only ordinary payload columns never leaks the nullable columns or
+their ``__valid`` helper fields into the result.
+
 Iterator
 ++++++++
 
