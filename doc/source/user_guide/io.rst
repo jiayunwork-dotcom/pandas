@@ -74,6 +74,30 @@ sep : str, defaults to ``','`` for :func:`read_csv`, ``\t`` for :func:`read_tabl
   delimiters are prone to ignoring quoted data. Regex example: ``'\\r\\t'``.
 delimiter : str, default ``None``
   Alternative argument name for sep.
+sep_mode : {'legacy', 'literal'}, default 'legacy'
+  How ``sep`` is interpreted.
+
+  * ``'legacy'`` keeps the historical behaviour: a single character is a
+    literal delimiter, and longer strings are regular expressions handled by
+    the Python engine.
+  * ``'literal'`` treats ``sep`` as a **whole-string delimiter** of 2 to 8
+    printable ASCII characters with no spaces, CR or LF, and no ``quotechar``
+    or ``escapechar``. The string may contain regex metacharacters and may have
+    overlapping prefixes/suffixes (e.g. ``'||'``, ``'aba'``, ``'<->'``). The
+    whole string is matched left-most-first outside quoted fields; a complete
+    match is consumed without reusing an overlap, and a partial prefix is
+    ordinary field content. This mode requires the ``'c'`` engine — an explicit
+    other engine is rejected, never silently degraded — and supports only
+    UTF-8 / UTF-8-SIG input.
+
+  ``sep_mode='literal'`` does not yet support ``compression``, ``memory_map``,
+  ``comment``, ``skiprows``, ``skipfooter``, ``parse_dates``, ``converters``,
+  a callable ``usecols``, ``on_bad_lines`` other than ``'error'``, or a
+  ``header`` other than the first row (or ``None``); passing them raises
+  ``ValueError``. The same keyword is accepted by :meth:`DataFrame.to_csv` so
+  that a file written with a literal separator can be read back symmetrically.
+
+  .. versionadded:: 2.3.3
 delim_whitespace : boolean, default False
   Specifies whether or not whitespace (e.g. ``' '`` or ``'\t'``)
   will be used as the delimiter. Equivalent to setting ``sep='\s+'``.
@@ -1272,11 +1296,48 @@ fields are filled with ``NaN``.
 
    pd.read_csv(StringIO(data), names=['a', 'b', 'c', 'd'])
 
+.. _io.literal_sep:
+
+Whole-string (literal) multi-character separators
+'''''''''''''''''''''''''''''''''''''''''''''''''
+
+By default a multi-character ``sep`` is interpreted as a regular expression and
+forces the Python engine, which can ignore quoting inside fields. When the
+separator really is a fixed literal string — including strings with overlapping
+prefixes such as ``"aba"`` or regex metacharacters such as ``"|.|"`` — pass
+``sep_mode="literal"``. The whole string is matched left to right only outside
+quoted fields, and a partial prefix is treated as ordinary content:
+
+.. ipython:: python
+
+   data = 'a||b||c\n1||"x||y"||3\n'
+   pd.read_csv(StringIO(data), sep="||", sep_mode="literal")
+
+The same keyword is available on :meth:`DataFrame.to_csv`, so the two ends share
+one boundary rule and files round-trip exactly (including the ambiguous case
+where a field tail overlaps the following separator):
+
+.. ipython:: python
+
+   df = pd.DataFrame({"a": ["ab", "中||文"], "b": ["c", ""]})
+   print(df.to_csv(sep="aba", sep_mode="literal", index=False))
+   pd.read_csv(
+       StringIO(df.to_csv(sep="aba", sep_mode="literal", index=False)),
+       sep="aba",
+       sep_mode="literal",
+   )
+
+The literal mode is intentionally C-engine only and limited to UTF-8 /
+UTF-8-SIG. It does not yet support ``compression``, ``memory_map``,
+``comment``, ``skiprows``, ``skipfooter``, ``parse_dates``, ``converters``, a
+callable ``usecols``, ``on_bad_lines`` other than ``"error"``, or a header other
+than the first row (or ``None``). See the :func:`read_csv` and
+:meth:`DataFrame.to_csv` docstrings for the full list.
+
 .. _io.dialect:
 
 Dialect
 '''''''
-
 The ``dialect`` keyword gives greater flexibility in specifying the file format.
 By default it uses the Excel dialect but you can specify either the dialect name
 or a :class:`python:csv.Dialect` instance.

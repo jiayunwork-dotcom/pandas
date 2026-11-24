@@ -122,6 +122,29 @@ sep : str, default {_default_sep}
     ``'\s+'`` will be interpreted as regular expressions and will also force
     the use of the Python parsing engine. Note that regex delimiters are prone
     to ignoring quoted data. Regex example: ``'\r\t'``.
+sep_mode : {{'legacy', 'literal'}}, default 'legacy'
+    How ``sep`` is interpreted.
+
+    * ``'legacy'`` (default): the historical behaviour.  A single character is
+      a literal separator; longer strings are regular expressions handled by the
+      Python engine.
+    * ``'literal'``: ``sep`` is a *whole-string* delimiter of 2 to 8 printable
+      ASCII characters with no spaces, CR or LF, and no ``quotechar`` /
+      ``escapechar``.  It may contain regex metacharacters and may have
+      overlapping prefixes/suffixes (e.g. ``'||'``, ``'aba'``, ``'<->'``).
+      The separator is only recognised outside quoted fields; a complete match
+      is consumed left-most-first without reusing an overlap, and a partial
+      prefix is ordinary field content.  This mode requires the ``'c'`` engine
+      (an explicit other engine is rejected, never silently degraded) and
+      supports only UTF-8 / UTF-8-SIG input.
+
+      ``sep_mode='literal'`` does not yet accept ``compression``,
+      ``memory_map``, ``comment``, ``skiprows``, ``skipfooter``,
+      ``parse_dates``, ``converters`` or a callable ``usecols``; passing them
+      raises ``ValueError``.  ``on_bad_lines`` is fixed to ``'error'`` and
+      ``header`` must be the first row (or ``None``).
+
+      .. versionadded:: 2.3.3
 delimiter : str, optional
     Alias for ``sep``.
 header : int, Sequence of int, 'infer' or None, default 'infer'
@@ -681,6 +704,7 @@ def read_csv(
     float_precision: Literal["high", "legacy"] | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> TextFileReader:
     ...
 
@@ -741,6 +765,7 @@ def read_csv(
     float_precision: Literal["high", "legacy"] | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> TextFileReader:
     ...
 
@@ -801,6 +826,7 @@ def read_csv(
     float_precision: Literal["high", "legacy"] | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> DataFrame:
     ...
 
@@ -861,6 +887,7 @@ def read_csv(
     float_precision: Literal["high", "legacy"] | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> DataFrame | TextFileReader:
     ...
 
@@ -939,6 +966,7 @@ def read_csv(
     float_precision: Literal["high", "legacy"] | None = None,
     storage_options: StorageOptions | None = None,
     dtype_backend: DtypeBackend | lib.NoDefault = lib.no_default,
+    sep_mode: Literal["legacy", "literal"] = "legacy",
 ) -> DataFrame | TextFileReader:
     if keep_date_col is not lib.no_default:
         # GH#55569
@@ -1020,6 +1048,7 @@ def read_csv(
         names,
         defaults={"delimiter": ","},
         dtype_backend=dtype_backend,
+        sep_mode=sep_mode,
     )
     kwds.update(kwds_defaults)
 
@@ -1079,6 +1108,7 @@ def read_table(
     float_precision: str | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> TextFileReader:
     ...
 
@@ -1136,6 +1166,7 @@ def read_table(
     float_precision: str | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> TextFileReader:
     ...
 
@@ -1193,6 +1224,7 @@ def read_table(
     float_precision: str | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> DataFrame:
     ...
 
@@ -1250,6 +1282,7 @@ def read_table(
     float_precision: str | None = ...,
     storage_options: StorageOptions = ...,
     dtype_backend: DtypeBackend | lib.NoDefault = ...,
+    sep_mode: Literal["legacy", "literal"] = ...,
 ) -> DataFrame | TextFileReader:
     ...
 
@@ -1327,6 +1360,7 @@ def read_table(
     float_precision: str | None = None,
     storage_options: StorageOptions | None = None,
     dtype_backend: DtypeBackend | lib.NoDefault = lib.no_default,
+    sep_mode: Literal["legacy", "literal"] = "legacy",
 ) -> DataFrame | TextFileReader:
     if keep_date_col is not lib.no_default:
         # GH#55569
@@ -1399,6 +1433,7 @@ def read_table(
         names,
         defaults={"delimiter": "\t"},
         dtype_backend=dtype_backend,
+        sep_mode=sep_mode,
     )
     kwds.update(kwds_defaults)
 
@@ -1689,16 +1724,35 @@ class TextFileReader(abc.Iterator):
 
         fallback_reason = None
 
+        sep = options["delimiter"]
+        delim_whitespace = options["delim_whitespace"]
+        sep_mode = options.get("sep_mode", "legacy")
+        literal = sep_mode == "literal"
+
+        if literal:
+            # Validate before any engine fallback so an unsupported option is
+            # reported as such rather than silently rerouted to the Python
+            # engine (literal mode is C-only).
+            self._validate_literal_options(options, engine, sep, delim_whitespace)
+            # The unsupported combinations are rejected above; these defaults
+            # are what the C reader stores so a chunked read cannot smuggle in
+            # compression/comment/skiprow state.
+            result["compression"] = None
+            result["memory_map"] = False
+            result["comment"] = None
+            result["skiprows"] = set()
+            result["skipfooter"] = 0
+            result["parse_dates"] = False
+
         # C engine not supported yet
-        if engine == "c":
+        if engine == "c" and not literal:
             if options["skipfooter"] > 0:
                 fallback_reason = "the 'c' engine does not support skipfooter"
                 engine = "python"
 
-        sep = options["delimiter"]
-        delim_whitespace = options["delim_whitespace"]
-
-        if sep is None and not delim_whitespace:
+        if literal:
+            pass
+        elif sep is None and not delim_whitespace:
             if engine in ("c", "pyarrow"):
                 fallback_reason = (
                     f"the '{engine}' engine does not support "
@@ -1838,6 +1892,69 @@ class TextFileReader(abc.Iterator):
 
         return result, engine
 
+    def _validate_literal_options(
+        self,
+        options: dict[str, Any],
+        engine: CSVEngine,
+        sep: Any,
+        delim_whitespace: bool,
+    ) -> None:
+        """
+        Validate the option combination for ``sep_mode="literal"``.
+
+        The literal path is strictly C-engine only.  An explicit non-C engine is
+        rejected (never silently degraded) and no fallback to the Python engine
+        is attempted.
+        """
+        from pandas.io.parsers.literal_sep import validate_literal_sep
+
+        if engine != "c":
+            raise ValueError(
+                f"sep_mode='literal' requires engine='c'; got engine={engine!r}"
+            )
+        if delim_whitespace:
+            raise ValueError(
+                "delim_whitespace=True cannot be combined with sep_mode='literal'"
+            )
+        if sep is None:
+            raise ValueError("sep must be given when sep_mode='literal'")
+
+        validate_literal_sep(
+            sep,
+            quotechar=options.get("quotechar"),
+            escapechar=options.get("escapechar"),
+        )
+
+        # Documented combinations that are intentionally not supported yet.
+        unsupported = {}
+        if options.get("compression") not in (None, "infer"):
+            unsupported["compression"] = options.get("compression")
+        if options.get("memory_map"):
+            unsupported["memory_map"] = options.get("memory_map")
+        if options.get("comment") is not None:
+            unsupported["comment"] = options.get("comment")
+        if options.get("skiprows"):
+            unsupported["skiprows"] = options.get("skiprows")
+        if options.get("skipfooter"):
+            unsupported["skipfooter"] = options.get("skipfooter")
+        if options.get("parse_dates", False) is not False:
+            unsupported["parse_dates"] = options.get("parse_dates")
+        if options.get("converters"):
+            unsupported["converters"] = options.get("converters")
+        if callable(options.get("usecols")):
+            unsupported["usecols"] = "callable"
+        if options.get("on_bad_lines") != ParserBase.BadLineHandleMethod.ERROR:
+            unsupported["on_bad_lines"] = options.get("on_bad_lines")
+        header = options.get("header")
+        if header not in (None, 0, "infer"):
+            unsupported["header"] = header
+        if unsupported:
+            keys = ", ".join(sorted(unsupported))
+            raise ValueError(
+                f"the following options are not supported with "
+                f"sep_mode='literal': {keys}"
+            )
+
     def __next__(self) -> DataFrame:
         try:
             return self.get_chunk()
@@ -1860,6 +1977,19 @@ class TextFileReader(abc.Iterator):
             raise ValueError(
                 f"Unknown engine: {engine} (valid options are {mapping.keys()})"
             )
+        if self.options.get("sep_mode") == "literal" and isinstance(
+            stringify_path(f), str
+        ):
+            # A path that inference would decompress is still an unsupported
+            # combination even though the default is ``compression="infer"``.
+            from pandas.io.common import infer_compression
+
+            inferred = infer_compression(stringify_path(f), "infer")
+            if inferred is not None:
+                raise ValueError(
+                    "sep_mode='literal' does not support compression "
+                    f"(inferred {inferred!r} from the file name)"
+                )
         if not isinstance(f, list):
             # open file here
             is_text = True
@@ -2140,6 +2270,7 @@ def _refine_defaults_read(
     names: Sequence[Hashable] | None | lib.NoDefault,
     defaults: dict[str, Any],
     dtype_backend: DtypeBackend | lib.NoDefault,
+    sep_mode: str = "legacy",
 ):
     """Validate/refine default values of input parameters of read_csv, read_table.
 
@@ -2221,6 +2352,43 @@ def _refine_defaults_read(
             "Specified a delimiter with both sep and "
             "delim_whitespace=True; you can only specify one."
         )
+
+    from pandas.io.parsers.literal_sep import (
+        LITERAL,
+        validate_sep_mode,
+    )
+
+    sep_mode = validate_sep_mode(sep_mode)
+    kwds["sep_mode"] = sep_mode
+
+    if sep_mode == LITERAL:
+        # The literal reader is C-only: never silently fall back.
+        if engine is not None and engine != "c":
+            raise ValueError(
+                f"sep_mode='literal' requires engine='c', got engine={engine!r}"
+            )
+        if delim_whitespace:
+            raise ValueError(
+                "delim_whitespace=True cannot be combined with sep_mode='literal'"
+            )
+        if dialect is not None:
+            raise ValueError("dialect cannot be combined with sep_mode='literal'")
+        kwds["engine"] = "c"
+        kwds["engine_specified"] = engine is not None
+        kwds["names"] = None if names is lib.no_default else names
+        kwds["delimiter"] = delimiter if delimiter is not lib.no_default else ","
+        if on_bad_lines == "error":
+            kwds["on_bad_lines"] = ParserBase.BadLineHandleMethod.ERROR
+        elif isinstance(on_bad_lines, str) or callable(on_bad_lines):
+            raise ValueError(
+                "sep_mode='literal' requires on_bad_lines='error', got "
+                f"{on_bad_lines!r}"
+            )
+        else:
+            kwds["on_bad_lines"] = on_bad_lines
+        check_dtype_backend(dtype_backend)
+        kwds["dtype_backend"] = dtype_backend
+        return kwds
 
     if delimiter == "\n":
         raise ValueError(

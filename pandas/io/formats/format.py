@@ -23,6 +23,7 @@ from typing import (
     Any,
     Callable,
     Final,
+    Literal,
     cast,
 )
 
@@ -980,6 +981,7 @@ class DataFrameRenderer:
         escapechar: str | None = None,
         errors: str = "strict",
         storage_options: StorageOptions | None = None,
+        sep_mode: Literal["legacy", "literal"] = "legacy",
     ) -> str | None:
         """
         Render dataframe as comma-separated file.
@@ -1009,6 +1011,7 @@ class DataFrameRenderer:
             doublequote=doublequote,
             escapechar=escapechar,
             storage_options=storage_options,
+            sep_mode=sep_mode,
             formatter=self.fmt,
         )
         csv_formatter.save()

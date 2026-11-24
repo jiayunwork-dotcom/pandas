@@ -25,6 +25,16 @@ See LICENSE for the license
 #define REACHED_EOF 1
 #define CALLING_READ_FAILED 2
 
+/* tokenize_bytes() needs more input before it can decide about a separator */
+#define PD_NEED_MORE_INPUT 2
+
+/*
+ * Up to this many bytes of a would-be multi-character separator are withheld
+ * at the end of a buffer until the following read arrives, so that a separator
+ * straddling a read boundary is recognised exactly once.
+ */
+#define PD_LITERAL_SEP_MAX 8
+
 /*
 
   C flat file parsing low level code for pandas / NumPy
@@ -126,6 +136,23 @@ typedef struct parser_t {
   int skipinitialspace; /* ignore spaces following delimiter? */
   int quoting;          /* style of quoting to write */
 
+  /*
+   * Literal multi-character separator support (read_csv(sep_mode="literal")).
+   * When literal_sep_len == 0 the classic single-byte delimiter above is used
+   * and none of the fields below are touched.
+   */
+  char literal_sep[PD_LITERAL_SEP_MAX]; /* the separator bytes              */
+  int literal_sep_len;                  /* 0 == disabled                    */
+  /*
+   * Number of trailing bytes of the current unquoted field that are withheld
+   * because they still match a prefix of the separator (a KMP candidate).  The
+   * withheld bytes are exactly literal_sep[0:literal_cand); they are not yet
+   * written to the field and therefore survive a buffer change without being
+   * stored anywhere else.
+   */
+  int literal_cand;
+  int literal_fail[PD_LITERAL_SEP_MAX]; /* KMP failure (border) table       */
+
   char commentchar;
   int allow_embedded_newline;
 
@@ -190,6 +217,12 @@ void parser_free(parser_t *self);
 void parser_del(parser_t *self);
 
 void parser_set_default_options(parser_t *self);
+
+/*
+ * Fill the KMP failure (border) table for parser_t.literal_sep.  Called by the
+ * reader after the separator bytes and length have been set.
+ */
+void literal_build_failure(parser_t *self);
 
 int tokenize_nrows(parser_t *self, size_t nrows, const char *encoding_errors);
 

@@ -15,6 +15,7 @@ import os
 from typing import (
     TYPE_CHECKING,
     Any,
+    Literal,
     cast,
 )
 
@@ -75,6 +76,7 @@ class CSVFormatter:
         doublequote: bool = True,
         escapechar: str | None = None,
         storage_options: StorageOptions | None = None,
+        sep_mode: Literal["legacy", "literal"] = "legacy",
     ) -> None:
         self.fmt = formatter
 
@@ -87,6 +89,7 @@ class CSVFormatter:
         self.storage_options = storage_options
 
         self.sep = sep
+        self.sep_mode = sep_mode
         self.index_label = self._initialize_index_label(index_label)
         self.errors = errors
         self.quoting = quoting or csvlib.QUOTE_MINIMAL
@@ -247,27 +250,74 @@ class CSVFormatter:
         """
         Create the writer & save.
         """
+        if self.sep_mode == "literal":
+            self._validate_literal_write()
+            # Literal output never compresses, and may target a binary handle.
+            compression: CompressionOptions = None
+        else:
+            compression = self.compression
+
         # apply compression and byte/text conversion
         with get_handle(
             self.filepath_or_buffer,
             self.mode,
             encoding=self.encoding,
             errors=self.errors,
-            compression=self.compression,
+            compression=compression,
             storage_options=self.storage_options,
         ) as handles:
-            # Note: self.encoding is irrelevant here
-            self.writer = csvlib.writer(
-                handles.handle,
-                lineterminator=self.lineterminator,
-                delimiter=self.sep,
-                quoting=self.quoting,
-                doublequote=self.doublequote,
-                escapechar=self.escapechar,
-                quotechar=self.quotechar,
-            )
+            if self.sep_mode == "literal":
+                from pandas.io.formats.literal_writer import LiteralWriter
+
+                self.writer = LiteralWriter(
+                    handles.handle,
+                    sep=self.sep,
+                    quoting=self.quoting,
+                    quotechar=self.quotechar,
+                    doublequote=self.doublequote,
+                    escapechar=self.escapechar,
+                    lineterminator=self.lineterminator,
+                )
+            else:
+                # Note: self.encoding is irrelevant here
+                self.writer = csvlib.writer(
+                    handles.handle,
+                    lineterminator=self.lineterminator,
+                    delimiter=self.sep,
+                    quoting=self.quoting,
+                    doublequote=self.doublequote,
+                    escapechar=self.escapechar,
+                    quotechar=self.quotechar,
+                )
 
             self._save()
+
+    def _validate_literal_write(self) -> None:
+        from pandas.io.parsers.literal_sep import (
+            validate_literal_encoding,
+            validate_literal_sep,
+        )
+
+        validate_literal_sep(
+            self.sep,
+            quotechar=self.quotechar,
+            escapechar=self.escapechar,
+        )
+        if self.compression not in (None, "infer"):
+            raise ValueError("sep_mode='literal' does not support compression on write")
+        encoding = self.encoding or "utf-8"
+        validate_literal_encoding(encoding)
+        # The documented scope is flat, uniquely named string columns with a
+        # single-level integer or string index.
+        if isinstance(self.obj.columns, ABCMultiIndex):
+            raise TypeError("sep_mode='literal' does not support MultiIndex columns")
+        if isinstance(self.obj.index, ABCMultiIndex):
+            raise TypeError("sep_mode='literal' does not support MultiIndex rows")
+        cols = self.obj.columns
+        if not cols.is_unique:
+            raise ValueError("sep_mode='literal' requires unique column names")
+        if not all(isinstance(c, str) for c in cols):
+            raise ValueError("sep_mode='literal' requires string column names")
 
     def _save(self) -> None:
         if self._need_to_save_header:

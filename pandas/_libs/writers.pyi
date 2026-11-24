@@ -18,3 +18,12 @@ def string_array_replace_from_nan_rep(
     arr: np.ndarray,  # np.ndarray[object, ndim=1]
     nan_rep: object,
 ) -> None: ...
+def literal_encode_field(
+    field: object,
+    sep: bytes,
+    quoting: int,
+    quotechar: str | None,
+    doublequote: bool,
+    escapechar: str | None,
+    is_last: bool,
+) -> bytes: ...

@@ -1277,6 +1277,7 @@ parser_defaults = {
     "encoding_errors": "strict",
     "on_bad_lines": ParserBase.BadLineHandleMethod.ERROR,
     "dtype_backend": lib.no_default,
+    "sep_mode": "legacy",
 }
 
 

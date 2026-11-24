@@ -17,6 +17,7 @@ GitHub. See Python Software Foundation License and BSD licenses for these.
 
 */
 #include "pandas/parser/tokenizer.h"
+#include "pandas/parser/literal.h"
 #include "pandas/portable.h"
 
 #include <ctype.h>
@@ -90,6 +91,9 @@ void parser_set_default_options(parser_t *self) {
   self->escapechar = 0;
 
   self->lineterminator = '\0'; /* NUL->standard logic */
+
+  self->literal_sep_len = 0;
+  self->literal_cand = 0;
 
   self->skipinitialspace = 0;
   self->quoting = QUOTE_MINIMAL;
@@ -194,6 +198,8 @@ int parser_init(parser_t *self) {
   self->word_start = 0;
 
   self->state = START_RECORD;
+
+  self->literal_cand = 0;
 
   self->error_msg = NULL;
   self->warn_msg = NULL;
@@ -632,6 +638,38 @@ static int parser_buffer_bytes(parser_t *self, size_t nbytes,
 #define IS_DELIMITER(c)                                                        \
   ((!delim_whitespace && c == delimiter) || (delim_whitespace && isblank(c)))
 
+/*
+ * Literal-mode hooks.  In literal mode a separator is never a single byte, so
+ * the ordinary IS_DELIMITER path must be disabled and the unquoted-field
+ * content path routed through the KMP automaton instead.  Outside literal mode
+ * these are compile-time-cheap no-ops that leave the classic behaviour intact.
+ */
+/*
+ * The tokenizer keeps loop-local ``stream``/``slen`` copies, but the literal
+ * helpers write through push_char(), which uses self->stream_len.  Keep the two
+ * in sync around every helper call.  make_stream_space() may move the stream,
+ * so the pointer is always recomputed from the (possibly new) base.
+ */
+#define LITERAL_LOAD() (self->stream_len = slen)
+#define LITERAL_STORE()                                                        \
+  do {                                                                         \
+    slen = self->stream_len;                                                   \
+    stream = self->stream + slen;                                              \
+  } while (0)
+
+#define LITERAL_STRUCTURAL()                                                   \
+  if (literal_mode) {                                                          \
+    LITERAL_LOAD();                                                            \
+    if (literal_flush(self) < 0) {                                             \
+      goto parsingerror;                                                       \
+    }                                                                          \
+    LITERAL_STORE();                                                           \
+  }
+
+#define LITERAL_SYNC() LITERAL_STORE()
+
+#define IS_DELIMITER_LIT(c) (IS_DELIMITER(c) && (!literal_mode || delim_whitespace))
+
 #define _TOKEN_CLEANUP()                                                       \
   self->stream_len = slen;                                                     \
   self->datapos = i;                                                           \
@@ -665,6 +703,91 @@ static int skip_this_line(parser_t *self, int64_t rownum) {
   }
 }
 
+/*
+ * Literal multi-character separators use a KMP automaton over the unquoted
+ * field bytes.  ``literal_cand`` counts how many trailing bytes of the current
+ * unquoted field still match a prefix of the separator; those bytes are held
+ * back (not written to the field) so a separator that straddles a read boundary
+ * is recognised exactly once, and so a prefix that turns out to be ordinary
+ * content is emitted exactly once.
+ *
+ * Only the withheld byte count is stored: the bytes themselves are exactly
+ * literal_sep[0:literal_cand], so nothing is duplicated and no history is kept.
+ */
+void literal_build_failure(parser_t *self) {
+  pd_literal_build_failure(self->literal_sep, self->literal_sep_len,
+                           self->literal_fail);
+}
+
+/*
+ * Make the withheld candidate bytes visible as ordinary field content.
+ *
+ * The separator alphabet excludes the quote char, the escape char and CR/LF, so
+ * a withheld prefix is always plain content: replaying it under the unquoted
+ * states only appends bytes.  Callers invoke this before ending a field, before
+ * an escape/quote transition, and at EOF.
+ */
+static int literal_flush(parser_t *self) {
+  if (self->literal_cand <= 0) {
+    return 0;
+  }
+  if (make_stream_space(self, (size_t)self->literal_cand + 1) < 0) {
+    return PARSER_OUT_OF_MEMORY;
+  }
+  for (int k = 0; k < self->literal_cand; ++k) {
+    const char ch = self->literal_sep[k];
+    if (push_char(self, ch) < 0) {
+      return PARSER_OUT_OF_MEMORY;
+    }
+  }
+  self->literal_cand = 0;
+  return 0;
+}
+
+/*
+ * Advance the KMP automaton by one plain (unquoted, unescaped) field byte and
+ * write out the bytes that stop being part of a separator prefix.
+ *
+ * Returns:
+ *   1  a full separator just completed (the caller ends the field); any old
+ *      candidate bytes that are not part of the separator were already written
+ *   0  no match; the bytes that are no longer a viable prefix were written,
+ *      and the byte is either withheld (extends the new prefix) or written
+ *  -1  out of memory
+ *
+ * Invariant: the withheld bytes are exactly literal_sep[0:literal_cand], so no
+ * input history is stored; a prefix survives a buffer boundary as its count.
+ */
+static int literal_feed(parser_t *self, unsigned char ch) {
+  /*
+   * Old withheld bytes are exactly sep[0:cand]; together with the incoming byte
+   * there are cand+1 bytes available.  The stepper leaves `cand` of them
+   * withheld, so cand+1-cand_new bytes must be emitted as content.  When the
+   * byte completes a separator, the whole separator (sep_len bytes) is consumed
+   * instead, so cand+1-sep_len bytes become content.
+   */
+  const int old_cand = self->literal_cand;
+  const int matched =
+      pd_literal_kmp_step(self->literal_sep, self->literal_sep_len,
+                          self->literal_fail, &self->literal_cand, ch);
+  const int emit =
+      matched ? old_cand + 1 - self->literal_sep_len
+              : old_cand + 1 - self->literal_cand;
+
+  for (int j = 0; j < emit && j < old_cand; ++j) {
+    if (push_char(self, self->literal_sep[j]) < 0) {
+      return -1;
+    }
+  }
+  if (emit > old_cand) {
+    /* the incoming byte is content (only when the new candidate is empty) */
+    if (push_char(self, (char)ch) < 0) {
+      return -1;
+    }
+  }
+  return matched;
+}
+
 static int tokenize_bytes(parser_t *self, size_t line_limit,
                           uint64_t start_lines) {
   char *buf = self->data + self->datapos;
@@ -675,6 +798,8 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
   const int delim_whitespace = self->delim_whitespace;
   const char delimiter = self->delimiter;
 
+  const int literal_mode = self->literal_sep_len > 0;
+
   // 1000 is something that couldn't fit in "char"
   // thus comparing a char to it would always be "false"
   const int carriage_symbol = (self->lineterminator == '\0') ? '\r' : 1000;
@@ -683,7 +808,10 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
   const int escape_symbol =
       (self->escapechar != '\0') ? self->escapechar : 1000;
 
-  if (make_stream_space(self, self->datalen - self->datapos) < 0) {
+  if (make_stream_space(
+          self, (size_t)(self->datalen - self->datapos) +
+                    (literal_mode ? (size_t)self->literal_sep_len + 1 : 0)) <
+      0) {
     const size_t bufsize = 100;
     self->error_msg = malloc(bufsize);
     snprintf(self->error_msg, bufsize, "out of memory");
@@ -702,7 +830,6 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
   char c;
   int64_t i;
   for (i = self->datapos; i < self->datalen; ++i) {
-    // next character in file
     c = *buf++;
 
     TRACE(("tokenize_bytes - Iter: %d Char: 0x%x Line %d field_count %d, "
@@ -868,9 +995,11 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
     case START_FIELD:
       // expecting field
       if (IS_TERMINATOR(c)) {
+        LITERAL_STRUCTURAL();
         END_FIELD();
         END_LINE();
       } else if (IS_CARRIAGE(c)) {
+        LITERAL_STRUCTURAL();
         END_FIELD();
         self->state = EAT_CRNL;
       } else if (IS_QUOTE(c)) {
@@ -881,7 +1010,7 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
         self->state = ESCAPED_CHAR;
       } else if (IS_SKIPPABLE_SPACE(c)) {
         // ignore space at start of field
-      } else if (IS_DELIMITER(c)) {
+      } else if (IS_DELIMITER_LIT(c)) {
         if (self->delim_whitespace) {
           self->state = EAT_WHITESPACE;
         } else {
@@ -893,8 +1022,25 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
         self->state = EAT_COMMENT;
       } else {
         // begin new unquoted field
-        PUSH_CHAR(c);
-        self->state = IN_FIELD;
+        if (literal_mode) {
+          LITERAL_LOAD();
+          const int _lit = literal_feed(self, (unsigned char)c);
+          if (_lit < 0) {
+            LITERAL_STORE();
+            goto parsingerror;
+          }
+          LITERAL_SYNC();
+          if (_lit == 1) {
+            // empty field terminated by a separator: start of record
+            END_FIELD();
+            self->state = START_FIELD;
+            break;
+          }
+          self->state = IN_FIELD;
+        } else {
+          PUSH_CHAR(c);
+          self->state = IN_FIELD;
+        }
       }
       break;
 
@@ -916,16 +1062,20 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
     case IN_FIELD:
       // in unquoted field
       if (IS_TERMINATOR(c)) {
+        LITERAL_STRUCTURAL();
         END_FIELD();
         END_LINE();
       } else if (IS_CARRIAGE(c)) {
+        LITERAL_STRUCTURAL();
         END_FIELD();
         self->state = EAT_CRNL;
       } else if (IS_ESCAPE_CHAR(c)) {
         // possible escaped character
+        LITERAL_STRUCTURAL();
         self->state = ESCAPED_CHAR;
-      } else if (IS_DELIMITER(c)) {
+      } else if (IS_DELIMITER_LIT(c)) {
         // end of field - end of line not reached yet
+        LITERAL_STRUCTURAL();
         END_FIELD();
 
         if (self->delim_whitespace) {
@@ -934,11 +1084,26 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
           self->state = START_FIELD;
         }
       } else if (IS_COMMENT_CHAR(c)) {
+        LITERAL_STRUCTURAL();
         END_FIELD();
         self->state = EAT_COMMENT;
       } else {
         // normal character - save in field
-        PUSH_CHAR(c);
+        if (literal_mode) {
+          LITERAL_LOAD();
+          const int _lit = literal_feed(self, (unsigned char)c);
+          if (_lit < 0) {
+            LITERAL_STORE();
+            goto parsingerror;
+          }
+          LITERAL_SYNC();
+          if (_lit == 1) {
+            END_FIELD();
+            self->state = START_FIELD;
+          }
+        } else {
+          PUSH_CHAR(c);
+        }
       }
       break;
 
@@ -973,8 +1138,9 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
 
         PUSH_CHAR(c);
         self->state = IN_QUOTED_FIELD;
-      } else if (IS_DELIMITER(c)) {
+      } else if (IS_DELIMITER_LIT(c)) {
         // end of field - end of line not reached yet
+        LITERAL_STRUCTURAL();
         END_FIELD();
 
         if (self->delim_whitespace) {
@@ -983,14 +1149,31 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
           self->state = START_FIELD;
         }
       } else if (IS_TERMINATOR(c)) {
+        LITERAL_STRUCTURAL();
         END_FIELD();
         END_LINE();
       } else if (IS_CARRIAGE(c)) {
+        LITERAL_STRUCTURAL();
         END_FIELD();
         self->state = EAT_CRNL;
       } else {
-        PUSH_CHAR(c);
+        // Trailing garbage after a closing quote: it is ordinary content.
         self->state = IN_FIELD;
+        if (literal_mode) {
+          LITERAL_LOAD();
+          const int _lit = literal_feed(self, (unsigned char)c);
+          if (_lit < 0) {
+            LITERAL_STORE();
+            goto parsingerror;
+          }
+          LITERAL_SYNC();
+          if (_lit == 1) {
+            END_FIELD();
+            self->state = START_FIELD;
+          }
+        } else {
+          PUSH_CHAR(c);
+        }
       }
       break;
 
@@ -1007,7 +1190,7 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
     case EAT_CRNL:
       if (c == '\n') {
         END_LINE();
-      } else if (IS_DELIMITER(c)) {
+      } else if (IS_DELIMITER_LIT(c)) {
         if (self->delim_whitespace) {
           END_LINE_STATE(EAT_WHITESPACE);
         } else {
@@ -1051,7 +1234,7 @@ static int tokenize_bytes(parser_t *self, size_t line_limit,
     case EAT_CRNL_NOP: // inside an ignored comment line
       self->state = START_RECORD;
       // \r line terminator -- parse this character again
-      if (c != '\n' && !IS_DELIMITER(c)) {
+      if (c != '\n' && !IS_DELIMITER_LIT(c)) {
         --i;
         --buf;
       }
@@ -1087,6 +1270,16 @@ static int parser_handle_eof(parser_t *self) {
 
   if (self->datalen != 0)
     return -1;
+
+  /*
+   * A separator prefix withheld at end of input is ordinary trailing content
+   * (an incomplete separator is never structural), so close the field with it.
+   */
+  if (self->literal_cand > 0) {
+    if (literal_flush(self) < 0) {
+      return -1;
+    }
+  }
 
   switch (self->state) {
   case START_RECORD:
@@ -1298,6 +1491,14 @@ static int _tokenize_helper(parser_t *self, size_t nrows, int all,
     if (!all && self->lines - start_lines >= nrows)
       break;
 
+    /*
+     * In literal mode the tokenizer stops at the end of the available bytes
+     * when the tail could still be a separator prefix (literal_cand > 0).  That
+     * prefix lives only as a count, so it survives the refill; do not treat the
+     * buffer end as EOF, just read the next block.  Any non-prefix tail has
+     * already been written out, so a refill only happens when the whole buffer
+     * was consumed.
+     */
     if (self->datapos == self->datalen) {
       status = parser_buffer_bytes(self, self->chunksize, encoding_errors);
 

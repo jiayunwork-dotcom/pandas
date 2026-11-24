@@ -198,6 +198,13 @@ cdef extern from "pandas/parser/tokenizer.h":
         int skipinitialspace       # ignore spaces following delimiter? */
         int quoting                # style of quoting to write */
 
+        # literal multi-character separator (sep_mode="literal"); disabled when
+        # literal_sep_len == 0
+        char literal_sep[8]        # the separator bytes
+        int literal_sep_len        # 0 == classic single-byte mode
+        int literal_cand           # withheld separator-prefix length
+        int literal_fail[8]        # KMP failure (border) table
+
         char commentchar
         int allow_embedded_newline
 
@@ -269,6 +276,8 @@ cdef extern from "pandas/parser/pd_parser.h":
     void parser_set_skipfirstnrows(parser_t *self, int64_t nrows)
 
     void parser_set_default_options(parser_t *self)
+
+    void literal_build_failure(parser_t *self)
 
     int parser_consume_rows(parser_t *self, size_t nrows)
 
@@ -404,7 +413,8 @@ cdef class TextReader:
                   float_precision=None,
                   bint skip_blank_lines=True,
                   encoding_errors=b"strict",
-                  dtype_backend="numpy"):
+                  dtype_backend="numpy",
+                  sep_mode="legacy"):
 
         # set encoding for native Python and C library
         if isinstance(encoding_errors, str):
@@ -429,6 +439,21 @@ cdef class TextReader:
 
         if delim_whitespace:
             self.parser.delim_whitespace = delim_whitespace
+        elif sep_mode == "literal":
+            # The literal separator is validated and encoded by the caller; it
+            # is pure printable ASCII so one byte is one character.
+            sep_bytes = (
+                delimiter.encode("ascii") if isinstance(delimiter, str)
+                else delimiter
+            )
+            if not 2 <= len(sep_bytes) <= 8:
+                raise ValueError(
+                    "literal separators must be 2 to 8 bytes long"
+                )
+            self.parser.literal_sep_len = len(sep_bytes)
+            for _i in range(len(sep_bytes)):
+                self.parser.literal_sep[_i] = <char>sep_bytes[_i]
+            literal_build_failure(self.parser)
         else:
             if len(delimiter) > 1:
                 raise ValueError("only length-1 separators excluded right now")

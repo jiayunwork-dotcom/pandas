@@ -3786,6 +3786,7 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
         decimal: str = ...,
         errors: OpenFileErrors = ...,
         storage_options: StorageOptions = ...,
+        sep_mode: Literal["legacy", "literal"] = ...,
     ) -> str:
         ...
 
@@ -3813,6 +3814,7 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
         decimal: str = ...,
         errors: OpenFileErrors = ...,
         storage_options: StorageOptions = ...,
+        sep_mode: Literal["legacy", "literal"] = ...,
     ) -> None:
         ...
 
@@ -3847,6 +3849,7 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
         decimal: str = ".",
         errors: OpenFileErrors = "strict",
         storage_options: StorageOptions | None = None,
+        sep_mode: Literal["legacy", "literal"] = "legacy",
     ) -> str | None:
         r"""
         Write object to a comma-separated values (csv) file.
@@ -3861,6 +3864,22 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
             file object is passed, `mode` might need to contain a `'b'`.
         sep : str, default ','
             String of length 1. Field delimiter for the output file.
+        sep_mode : {{'legacy', 'literal'}}, default 'legacy'
+            How ``sep`` is interpreted.
+
+            * ``'legacy'`` keeps the historical single-character delimiter
+              behaviour.
+            * ``'literal'`` treats ``sep`` as a whole-string delimiter of 2 to 8
+              printable ASCII characters with no spaces, CR or LF, and no
+              ``quotechar`` / ``escapechar``. Fields that contain the separator,
+              a quotechar, a line break, or a tail that would overlap the
+              following separator are quoted (or, under ``QUOTE_NONE``, escaped)
+              so the reader recovers the exact values. Literal output does not
+              support compression and requires unique string column names with a
+              single-level integer or string index; ``MultiIndex`` rows or
+              columns are rejected.
+
+            .. versionadded:: 2.3.3
         na_rep : str, default ''
             Missing data representation.
         float_format : str, Callable, default None
@@ -4003,6 +4022,7 @@ class NDFrame(PandasObject, indexing.IndexingMixin):
             doublequote=doublequote,
             escapechar=escapechar,
             storage_options=storage_options,
+            sep_mode=sep_mode,
         )
 
     # ----------------------------------------------------------------------

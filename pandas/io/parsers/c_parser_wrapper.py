@@ -64,6 +64,19 @@ class CParserWrapper(ParserBase):
 
         self.low_memory = kwds.pop("low_memory", False)
 
+        sep_mode = kwds.pop("sep_mode", "legacy")
+        if sep_mode == "literal":
+            # Literal multi-character separators must be read by the C engine
+            # only and are limited to UTF-8 / UTF-8-SIG.  Wrap the source so
+            # short reads and a split BOM are handled uniformly.
+            from pandas.io.parsers.literal_io import LiteralSource
+            from pandas.io.parsers.literal_sep import validate_literal_encoding
+
+            encoding = kwds.get("encoding") or "utf-8"
+            validate_literal_encoding(encoding)
+            encoding_errors = kwds.get("encoding_errors") or "strict"
+            src = LiteralSource(src, encoding_errors=encoding_errors)
+
         # #2442
         # error: Cannot determine type of 'index_col'
         kwds["allow_leading_cols"] = (
@@ -90,6 +103,8 @@ class CParserWrapper(ParserBase):
         if kwds["dtype_backend"] == "pyarrow":
             # Fail here loudly instead of in cython after reading
             import_optional_dependency("pyarrow")
+
+        kwds["sep_mode"] = sep_mode
         self._reader = parsers.TextReader(src, **kwds)
 
         self.unnamed_cols = self._reader.unnamed_cols

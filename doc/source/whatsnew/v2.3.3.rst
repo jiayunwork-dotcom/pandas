@@ -57,6 +57,13 @@ Bug fixes
 Other changes
 ~~~~~~~~~~~~~
 
+- :func:`read_csv` and :meth:`DataFrame.to_csv` gained a ``sep_mode="literal"``
+  option for whole-string multi-character separators (2 to 8 printable ASCII
+  characters, no spaces) that are matched left to right only outside quoted
+  fields, including separators with overlapping prefixes (e.g. ``"aba"``) or
+  regex metacharacters (e.g. ``"|.|"``). It uses the C engine only. See
+  :ref:`io.literal_sep`.
+
 - The deprecation of using :meth:`Series.resample` and :meth:`DataFrame.resample`
   with a :class:`PeriodIndex` (and the 'convention' keyword) has been undone.
   Resampling with a :class:`PeriodIndex` is supported again, but a subset of

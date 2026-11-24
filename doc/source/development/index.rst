@@ -19,6 +19,7 @@ Development
     maintaining
     internals
     copy_on_write
+    literal_sep_design
     debugging_extensions
     extending
     developer
